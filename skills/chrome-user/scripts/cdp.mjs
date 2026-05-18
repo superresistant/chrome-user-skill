@@ -1,11 +1,8 @@
 #!/usr/bin/env node
-// cdp - lightweight Chrome DevTools Protocol CLI
-// Uses raw CDP over WebSocket, no Puppeteer dependency.
-// Requires Node 22+ (built-in WebSocket).
-//
-// Per-tab persistent daemon: page commands go through a daemon that holds
-// the CDP session open. Chrome's "Allow debugging" modal fires once per
-// daemon (= once per tab). Daemons auto-exit after 20min idle.
+// cdp - Chrome DevTools Protocol CLI over raw WebSocket. Node 22+.
+// Per-tab daemon holds the CDP session; Chrome's Allow-debugging modal fires
+// once per daemon. Daemon self-cleans on tab close and browser exit;
+// IDLE_TIMEOUT is the backstop. CDP_IDLE_MS overrides (ms); =0 disables.
 
 import { readFileSync, writeFileSync, unlinkSync, existsSync, mkdirSync } from 'fs';
 import { homedir } from 'os';
@@ -15,80 +12,45 @@ import net from 'net';
 
 const TIMEOUT = 15000;
 const NAVIGATION_TIMEOUT = 30000;
-const IDLE_TIMEOUT = 20 * 60 * 1000;
+const DEFAULT_IDLE = 30 * 24 * 60 * 60 * 1000; // 30 days
+const IDLE_TIMEOUT = (() => {
+  const raw = process.env.CDP_IDLE_MS;
+  if (raw === undefined) return DEFAULT_IDLE;
+  const n = Number(raw);
+  if (n === 0) return null; // disabled
+  if (!Number.isFinite(n) || n < 1000) return DEFAULT_IDLE;
+  return n;
+})();
 const DAEMON_CONNECT_RETRIES = 20;
 const DAEMON_CONNECT_DELAY = 300;
 const MIN_TARGET_PREFIX_LEN = 8;
-const IS_WINDOWS = process.platform === 'win32';
-if (!IS_WINDOWS) process.umask(0o077);
-const RUNTIME_DIR = IS_WINDOWS
-  ? resolve(process.env.LOCALAPPDATA || resolve(homedir(), 'AppData', 'Local'), 'cdp')
-  : process.env.XDG_RUNTIME_DIR
-    ? resolve(process.env.XDG_RUNTIME_DIR, 'cdp')
-    : resolve(homedir(), '.cache', 'cdp');
+process.umask(0o077);
+const RUNTIME_DIR = process.env.XDG_RUNTIME_DIR
+  ? resolve(process.env.XDG_RUNTIME_DIR, 'cdp')
+  : resolve(homedir(), '.cache', 'cdp');
 try { mkdirSync(RUNTIME_DIR, { recursive: true, mode: 0o700 }); } catch {}
 const PAGES_CACHE = resolve(RUNTIME_DIR, 'pages.json');
 
 function sockPath(targetId) {
-  return IS_WINDOWS
-    ? `\\\\.\\pipe\\cdp-${targetId}`
-    : resolve(RUNTIME_DIR, `cdp-${targetId}.sock`);
+  return resolve(RUNTIME_DIR, `cdp-${targetId}.sock`);
 }
 
 function getWsUrl() {
-  const home = homedir();
-  // macOS: ~/Library/Application Support/<name>/DevToolsActivePort
-  const macBrowsers = [
-    'Google/Chrome', 'Google/Chrome Beta', 'Google/Chrome for Testing',
-    'Chromium', 'BraveSoftware/Brave-Browser', 'Microsoft Edge',
-  ];
-  // Linux: ~/.config/<name>/DevToolsActivePort
-  const linuxBrowsers = [
-    'google-chrome', 'google-chrome-beta', 'chromium',
-    'vivaldi', 'vivaldi-snapshot',
-    'BraveSoftware/Brave-Browser', 'microsoft-edge',
-  ];
-  // Linux Flatpak: ~/.var/app/<app-id>/config/<name>/DevToolsActivePort
-  const flatpakBrowsers = [
-    ['org.chromium.Chromium', 'chromium'],
-    ['com.google.Chrome', 'google-chrome'],
-    ['com.brave.Browser', 'BraveSoftware/Brave-Browser'],
-    ['com.microsoft.Edge', 'microsoft-edge'],
-    ['com.vivaldi.Vivaldi', 'vivaldi'],
-  ];
+  const browsers = ['google-chrome', 'google-chrome-beta', 'chromium', 'vivaldi', 'vivaldi-snapshot', 'BraveSoftware/Brave-Browser', 'microsoft-edge'];
+  const base = resolve(homedir(), '.config');
+  const pair = (name) => [resolve(base, name, 'DevToolsActivePort'), resolve(base, name, 'Default/DevToolsActivePort')];
   const candidates = [
     process.env.CDP_PORT_FILE,
-    ...macBrowsers.flatMap(b => [
-      resolve(home, 'Library/Application Support', b, 'DevToolsActivePort'),
-      resolve(home, 'Library/Application Support', b, 'Default/DevToolsActivePort'),
-    ]),
-    ...linuxBrowsers.flatMap(b => [
-      resolve(home, '.config', b, 'DevToolsActivePort'),
-      resolve(home, '.config', b, 'Default/DevToolsActivePort'),
-    ]),
-    ...flatpakBrowsers.flatMap(([appId, name]) => [
-      resolve(home, '.var/app', appId, 'config', name, 'DevToolsActivePort'),
-      resolve(home, '.var/app', appId, 'config', name, 'Default/DevToolsActivePort'),
-    ]),
-    // Windows: %LOCALAPPDATA%/<name>/User Data/DevToolsActivePort
-    ...(IS_WINDOWS ? ['Google/Chrome', 'BraveSoftware/Brave-Browser', 'Microsoft/Edge'].flatMap(b => {
-      const base = process.env.LOCALAPPDATA || resolve(home, 'AppData/Local');
-      return [
-        resolve(base, b, 'User Data/DevToolsActivePort'),
-        resolve(base, b, 'User Data/Default/DevToolsActivePort'),
-      ];
-    }) : []),
+    ...browsers.flatMap(pair),
   ].filter(Boolean);
-  const portFile = candidates.find(p => existsSync(p));
+  const portFile = candidates.find(existsSync);
   if (!portFile) throw new Error('No DevToolsActivePort found. Enable remote debugging at chrome://inspect/#remote-debugging');
   const lines = readFileSync(portFile, 'utf8').trim().split('\n');
   if (lines.length < 2 || !lines[0] || !lines[1]) throw new Error(`Invalid DevToolsActivePort file: ${portFile}`);
-  const host = process.env.CDP_HOST || '127.0.0.1';
-  return `ws://${host}:${lines[0]}${lines[1]}`;
+  return `ws://${process.env.CDP_HOST || '127.0.0.1'}:${lines[0]}${lines[1]}`;
 }
 
 const sleep = (ms) => new Promise(r => setTimeout(r, ms));
-
 
 function resolvePrefix(prefix, candidates, noun = 'target', missingHint = '') {
   const upper = prefix.toUpperCase();
@@ -112,10 +74,6 @@ function getDisplayPrefixLength(targetIds) {
   }
   return maxLen;
 }
-
-// ---------------------------------------------------------------------------
-// CDP WebSocket client
-// ---------------------------------------------------------------------------
 
 class CDP {
   #ws; #id = 0; #pending = new Map(); #eventHandlers = new Map(); #closeHandlers = [];
@@ -202,9 +160,7 @@ class CDP {
   close() { this.#ws.close(); }
 }
 
-// ---------------------------------------------------------------------------
 // Command implementations — return strings, take (cdp, sessionId)
-// ---------------------------------------------------------------------------
 
 async function getPages(cdp) {
   const { targetInfos } = await cdp.send('Target.getTargets');
@@ -220,52 +176,14 @@ function formatPageList(pages) {
   }).join('\n');
 }
 
-function shouldShowAxNode(node, compact = false) {
-  const role = node.role?.value || '';
-  const name = node.name?.value ?? '';
-  const value = node.value?.value;
-  if (compact && role === 'InlineTextBox') return false;
-  return role !== 'none' && role !== 'generic' && !(name === '' && (value === '' || value == null));
-}
-
-function formatAxNode(node, depth) {
-  const role = node.role?.value || '';
-  const name = node.name?.value ?? '';
-  const value = node.value?.value;
-  const indent = '  '.repeat(Math.min(depth, 10));
-  let line = `${indent}[${role}]`;
-  if (name !== '') line += ` ${name}`;
-  if (!(value === '' || value == null)) line += ` = ${JSON.stringify(value)}`;
-  return line;
-}
-
-function orderedAxChildren(node, nodesById, childrenByParent) {
-  const children = [];
-  const seen = new Set();
-  for (const childId of node.childIds || []) {
-    const child = nodesById.get(childId);
-    if (child && !seen.has(child.nodeId)) {
-      seen.add(child.nodeId);
-      children.push(child);
-    }
-  }
-  for (const child of childrenByParent.get(node.nodeId) || []) {
-    if (!seen.has(child.nodeId)) {
-      seen.add(child.nodeId);
-      children.push(child);
-    }
-  }
-  return children;
-}
-
 async function snapshotStr(cdp, sid, compact = false) {
   const { nodes } = await cdp.send('Accessibility.getFullAXTree', {}, sid);
-  const nodesById = new Map(nodes.map(node => [node.nodeId, node]));
+  const nodesById = new Map(nodes.map(n => [n.nodeId, n]));
   const childrenByParent = new Map();
-  for (const node of nodes) {
-    if (!node.parentId) continue;
-    if (!childrenByParent.has(node.parentId)) childrenByParent.set(node.parentId, []);
-    childrenByParent.get(node.parentId).push(node);
+  for (const n of nodes) {
+    if (!n.parentId) continue;
+    if (!childrenByParent.has(n.parentId)) childrenByParent.set(n.parentId, []);
+    childrenByParent.get(n.parentId).push(n);
   }
 
   const lines = [];
@@ -273,15 +191,27 @@ async function snapshotStr(cdp, sid, compact = false) {
   function visit(node, depth) {
     if (!node || visited.has(node.nodeId)) return;
     visited.add(node.nodeId);
-    if (shouldShowAxNode(node, compact)) lines.push(formatAxNode(node, depth));
-    for (const child of orderedAxChildren(node, nodesById, childrenByParent)) {
-      visit(child, depth + 1);
+    const role = node.role?.value || '';
+    const name = node.name?.value ?? '';
+    const value = node.value?.value;
+    const hasValue = !(value === '' || value == null);
+    const show = !(compact && role === 'InlineTextBox')
+      && role !== 'none' && role !== 'generic'
+      && !(name === '' && !hasValue);
+    if (show) {
+      let line = `${'  '.repeat(Math.min(depth, 10))}[${role}]`;
+      if (name !== '') line += ` ${name}`;
+      if (hasValue) line += ` = ${JSON.stringify(value)}`;
+      lines.push(line);
     }
+    const seen = new Set();
+    const pushChild = c => { if (c && !seen.has(c.nodeId)) { seen.add(c.nodeId); visit(c, depth + 1); } };
+    for (const id of node.childIds || []) pushChild(nodesById.get(id));
+    for (const c of childrenByParent.get(node.nodeId) || []) pushChild(c);
   }
 
-  const roots = nodes.filter(node => !node.parentId || !nodesById.has(node.parentId));
-  for (const root of roots) visit(root, 0);
-  for (const node of nodes) visit(node, 0);
+  for (const n of nodes) if (!n.parentId || !nodesById.has(n.parentId)) visit(n, 0);
+  for (const n of nodes) visit(n, 0);
 
   return lines.join('\n');
 }
@@ -299,40 +229,24 @@ async function evalStr(cdp, sid, expression) {
 }
 
 async function shotStr(cdp, sid, filePath, targetId) {
-  // Get device scale factor so we can report coordinate mapping
   let dpr = 1;
   try {
-    const metrics = await cdp.send('Page.getLayoutMetrics', {}, sid);
-    dpr = metrics.visualViewport?.clientWidth
-      ? metrics.cssVisualViewport?.clientWidth
-        ? Math.round((metrics.visualViewport.clientWidth / metrics.cssVisualViewport.clientWidth) * 100) / 100
-        : 1
-      : 1;
-    // Simpler: deviceScaleFactor is on the root Page metrics
-    const { deviceScaleFactor } = await cdp.send('Emulation.getDeviceMetricsOverride', {}, sid).catch(() => ({}));
-    if (deviceScaleFactor) dpr = deviceScaleFactor;
+    const parsed = parseFloat(await evalStr(cdp, sid, 'window.devicePixelRatio'));
+    if (parsed > 0) dpr = parsed;
   } catch {}
-  // Fallback: try to get DPR from JS
-  if (dpr === 1) {
-    try {
-      const raw = await evalStr(cdp, sid, 'window.devicePixelRatio');
-      const parsed = parseFloat(raw);
-      if (parsed > 0) dpr = parsed;
-    } catch {}
-  }
 
   const { data } = await cdp.send('Page.captureScreenshot', { format: 'png' }, sid);
   const out = filePath || resolve(RUNTIME_DIR, `screenshot-${(targetId || 'unknown').slice(0, 8)}.png`);
   writeFileSync(out, Buffer.from(data, 'base64'));
 
-  const lines = [out];
-  lines.push(`Screenshot saved. Device pixel ratio (DPR): ${dpr}`);
-  lines.push(`Coordinate mapping:`);
-  lines.push(`  Screenshot pixels → CSS pixels (for CDP Input events): divide by ${dpr}`);
-  lines.push(`  e.g. screenshot point (${Math.round(100 * dpr)}, ${Math.round(200 * dpr)}) → CSS (100, 200) → use clickxy <target> 100 200`);
-  if (dpr !== 1) {
-    lines.push(`  On this ${dpr}x display: CSS px = screenshot px / ${dpr} ≈ screenshot px × ${Math.round(100/dpr)/100}`);
-  }
+  const lines = [
+    out,
+    `Screenshot saved. Device pixel ratio (DPR): ${dpr}`,
+    `Coordinate mapping:`,
+    `  Screenshot pixels → CSS pixels (for CDP Input events): divide by ${dpr}`,
+    `  e.g. screenshot point (${Math.round(100 * dpr)}, ${Math.round(200 * dpr)}) → CSS (100, 200) → use clickxy <target> 100 200`,
+  ];
+  if (dpr !== 1) lines.push(`  On this ${dpr}x display: CSS px = screenshot px / ${dpr} ≈ screenshot px × ${Math.round(100/dpr)/100}`);
   return lines.join('\n');
 }
 
@@ -341,30 +255,6 @@ async function htmlStr(cdp, sid, selector) {
     ? `document.querySelector(${JSON.stringify(selector)})?.outerHTML || 'Element not found'`
     : `document.documentElement.outerHTML`;
   return evalStr(cdp, sid, expr);
-}
-
-async function waitForDocumentReady(cdp, sid, timeoutMs = NAVIGATION_TIMEOUT) {
-  const deadline = Date.now() + timeoutMs;
-  let lastState = '';
-  let lastError;
-  while (Date.now() < deadline) {
-    try {
-      const state = await evalStr(cdp, sid, 'document.readyState');
-      lastState = state;
-      if (state === 'complete') return;
-    } catch (e) {
-      lastError = e;
-    }
-    await sleep(200);
-  }
-
-  if (lastState) {
-    throw new Error(`Timed out waiting for navigation to finish (last readyState: ${lastState})`);
-  }
-  if (lastError) {
-    throw new Error(`Timed out waiting for navigation to finish (${lastError.message})`);
-  }
-  throw new Error('Timed out waiting for navigation to finish');
 }
 
 async function navStr(cdp, sid, url) {
@@ -379,17 +269,21 @@ async function navStr(cdp, sid, url) {
   await cdp.send('Page.enable', {}, sid);
   const loadEvent = cdp.waitForEvent('Page.loadEventFired', NAVIGATION_TIMEOUT);
   const result = await cdp.send('Page.navigate', { url }, sid);
-  if (result.errorText) {
-    loadEvent.cancel();
-    throw new Error(result.errorText);
+  if (result.errorText) { loadEvent.cancel(); throw new Error(result.errorText); }
+  if (result.loaderId) await loadEvent.promise;
+  else loadEvent.cancel();
+
+  // Poll for document.readyState === 'complete' (SPA hydration may continue past load).
+  const deadline = Date.now() + 5000;
+  let lastState = '', lastError;
+  while (Date.now() < deadline) {
+    try {
+      lastState = await evalStr(cdp, sid, 'document.readyState');
+      if (lastState === 'complete') return `Navigated to ${url}`;
+    } catch (e) { lastError = e; }
+    await sleep(200);
   }
-  if (result.loaderId) {
-    await loadEvent.promise;
-  } else {
-    loadEvent.cancel();
-  }
-  await waitForDocumentReady(cdp, sid, 5000);
-  return `Navigated to ${url}`;
+  throw new Error(`Timed out waiting for navigation to finish${lastState ? ` (last readyState: ${lastState})` : lastError ? ` (${lastError.message})` : ''}`);
 }
 
 async function netStr(cdp, sid) {
@@ -402,7 +296,6 @@ async function netStr(cdp, sid) {
   ).join('\n');
 }
 
-// Click element by CSS selector
 async function clickStr(cdp, sid, selector) {
   if (!selector) throw new Error('CSS selector required');
   const expr = `
@@ -420,7 +313,6 @@ async function clickStr(cdp, sid, selector) {
   return `Clicked <${r.tag}> "${r.text}"`;
 }
 
-// Click at CSS pixel coordinates using Input.dispatchMouseEvent
 async function clickXyStr(cdp, sid, x, y) {
   const cx = parseFloat(x);
   const cy = parseFloat(y);
@@ -433,14 +325,13 @@ async function clickXyStr(cdp, sid, x, y) {
   return `Clicked at CSS (${cx}, ${cy})`;
 }
 
-// Type text using Input.insertText (works in cross-origin iframes, unlike eval)
+// Input.insertText works in cross-origin iframes, unlike eval-based typing
 async function typeStr(cdp, sid, text) {
   if (text == null || text === '') throw new Error('text required');
   await cdp.send('Input.insertText', { text }, sid);
   return `Typed ${text.length} characters`;
 }
 
-// Load-more: repeatedly click a button/selector until it disappears
 async function loadAllStr(cdp, sid, selector, intervalMs = 1500) {
   if (!selector) throw new Error('CSS selector required');
   let clicks = 0;
@@ -467,7 +358,6 @@ async function loadAllStr(cdp, sid, selector, intervalMs = 1500) {
   return `Clicked "${selector}" ${clicks} time(s) until it disappeared`;
 }
 
-// Send a raw CDP command and return the result as JSON
 async function evalRawStr(cdp, sid, method, paramsJson) {
   if (!method) throw new Error('CDP method required (e.g. "DOM.getDocument")');
   let params = {};
@@ -479,9 +369,7 @@ async function evalRawStr(cdp, sid, method, paramsJson) {
   return JSON.stringify(result, null, 2);
 }
 
-// ---------------------------------------------------------------------------
 // Per-tab daemon
-// ---------------------------------------------------------------------------
 
 async function runDaemon(targetId) {
   const sp = sockPath(targetId);
@@ -504,13 +392,12 @@ async function runDaemon(targetId) {
     process.exit(1);
   }
 
-  // Shutdown helpers
   let alive = true;
   function shutdown() {
     if (!alive) return;
     alive = false;
     server.close();
-    if (!IS_WINDOWS) try { unlinkSync(sp); } catch {}
+    try { unlinkSync(sp); } catch {}
     cdp.close();
     process.exit(0);
   }
@@ -526,14 +413,24 @@ async function runDaemon(targetId) {
   process.on('SIGTERM', shutdown);
   process.on('SIGINT', shutdown);
 
-  // Idle timer
-  let idleTimer = setTimeout(shutdown, IDLE_TIMEOUT);
-  function resetIdle() {
-    clearTimeout(idleTimer);
-    idleTimer = setTimeout(shutdown, IDLE_TIMEOUT);
+  // Chain setTimeouts past Node's 2^31-1 ms cap so 30d default works
+  // (otherwise Node truncates to 1ms and daemon exits immediately)
+  const MAX_TIMEOUT = 0x7FFFFFFF;
+  let idleTimer = null;
+  function scheduleShutdown(remaining) {
+    if (remaining <= MAX_TIMEOUT) {
+      idleTimer = setTimeout(shutdown, remaining);
+    } else {
+      idleTimer = setTimeout(() => scheduleShutdown(remaining - MAX_TIMEOUT), MAX_TIMEOUT);
+    }
   }
+  function resetIdle() {
+    if (IDLE_TIMEOUT === null) return;
+    if (idleTimer) clearTimeout(idleTimer);
+    scheduleShutdown(IDLE_TIMEOUT);
+  }
+  if (IDLE_TIMEOUT !== null) scheduleShutdown(IDLE_TIMEOUT);
 
-  // Handle a command
   async function handleCommand({ cmd, args }) {
     resetIdle();
     try {
@@ -549,12 +446,12 @@ async function runDaemon(targetId) {
           result = JSON.stringify(pages);
           break;
         }
-        case 'snap': case 'snapshot': result = await snapshotStr(cdp, sessionId, true); break;
+        case 'snap': result = await snapshotStr(cdp, sessionId, true); break;
         case 'eval': result = await evalStr(cdp, sessionId, args[0]); break;
-        case 'shot': case 'screenshot': result = await shotStr(cdp, sessionId, args[0], targetId); break;
+        case 'shot': result = await shotStr(cdp, sessionId, args[0], targetId); break;
         case 'html': result = await htmlStr(cdp, sessionId, args[0]); break;
-        case 'nav': case 'navigate': result = await navStr(cdp, sessionId, args[0]); break;
-        case 'net': case 'network': result = await netStr(cdp, sessionId); break;
+        case 'nav': result = await navStr(cdp, sessionId, args[0]); break;
+        case 'net': result = await netStr(cdp, sessionId); break;
         case 'click': result = await clickStr(cdp, sessionId, args[0]); break;
         case 'clickxy': result = await clickXyStr(cdp, sessionId, args[0], args[1]); break;
         case 'type': result = await typeStr(cdp, sessionId, args[0]); break;
@@ -569,11 +466,7 @@ async function runDaemon(targetId) {
     }
   }
 
-  // Unix socket server — NDJSON protocol
-  // Wire format: each message is one JSON object followed by \n (newline-delimited JSON).
-  // Request:  { "id": <number>, "cmd": "<command>", "args": ["arg1", "arg2", ...] }
-  // Response: { "id": <number>, "ok": <boolean>, "result": "<string>" }
-  //           or { "id": <number>, "ok": false, "error": "<message>" }
+  // NDJSON over Unix socket. See USAGE for wire format.
   const server = net.createServer((conn) => {
     let buf = '';
     conn.on('data', (chunk) => {
@@ -603,13 +496,11 @@ async function runDaemon(targetId) {
     process.exit(1);
   });
 
-  if (!IS_WINDOWS) try { unlinkSync(sp); } catch {}
+  try { unlinkSync(sp); } catch {}
   server.listen(sp);
 }
 
-// ---------------------------------------------------------------------------
 // CLI ↔ daemon communication
-// ---------------------------------------------------------------------------
 
 function connectToSocket(sp) {
   return new Promise((resolve, reject) => {
@@ -621,20 +512,12 @@ function connectToSocket(sp) {
 
 async function getOrStartTabDaemon(targetId) {
   const sp = sockPath(targetId);
-  // Try existing daemon
   try { return await connectToSocket(sp); } catch {}
+  try { unlinkSync(sp); } catch {}
 
-  // Clean stale socket
-  if (!IS_WINDOWS) try { unlinkSync(sp); } catch {}
+  spawn(process.execPath, [process.argv[1], '_daemon', targetId], { detached: true, stdio: 'ignore' }).unref();
 
-  // Spawn daemon
-  const child = spawn(process.execPath, [process.argv[1], '_daemon', targetId], {
-    detached: true,
-    stdio: 'ignore',
-  });
-  child.unref();
-
-  // Wait for socket (includes time for user to click Allow)
+  // Retry loop covers daemon startup + time for user to click Allow
   for (let i = 0; i < DAEMON_CONNECT_RETRIES; i++) {
     await sleep(DAEMON_CONNECT_DELAY);
     try { return await connectToSocket(sp); } catch {}
@@ -694,9 +577,7 @@ function sendCommand(conn, req) {
   });
 }
 
-// ---------------------------------------------------------------------------
 // Stop daemons
-// ---------------------------------------------------------------------------
 
 async function stopDaemons(targetPrefix) {
   if (!existsSync(PAGES_CACHE)) return;
@@ -711,85 +592,63 @@ async function stopDaemons(targetPrefix) {
       const conn = await connectToSocket(sp);
       await sendCommand(conn, { cmd: 'stop' });
     } catch {
-      if (!IS_WINDOWS) try { unlinkSync(sp); } catch {}
+      try { unlinkSync(sp); } catch {}
     }
   }
 }
 
-// ---------------------------------------------------------------------------
 // Main
-// ---------------------------------------------------------------------------
 
-const USAGE = `cdp - lightweight Chrome DevTools Protocol CLI (no Puppeteer)
+const USAGE = `cdp - Chrome DevTools Protocol CLI (no Puppeteer, Node 22+)
 
 Usage: cdp <command> [args]
 
-  list                              List open pages (shows unique target prefixes)
+  list                              List open pages with unique targetId prefixes
   snap  <target>                    Accessibility tree snapshot
-  eval  <target> <expr>             Evaluate JS expression
-  shot  <target> [file]             Screenshot (default: screenshot-<target>.png in runtime dir); prints coordinate mapping
-  html  <target> [selector]         Get HTML (full page or CSS selector)
-  nav   <target> <url>              Navigate to URL and wait for load completion
-  net   <target>                    Network performance entries
-  click   <target> <selector>       Click an element by CSS selector
-  clickxy <target> <x> <y>          Click at CSS pixel coordinates (see coordinate note below)
-  type    <target> <text>           Type text at current focus via Input.insertText
-                                    Works in cross-origin iframes unlike eval-based approaches
-  loadall <target> <selector> [ms]  Repeatedly click a "load more" button until it disappears
-                                    Optional interval in ms between clicks (default 1500)
-  evalraw <target> <method> [json]  Send a raw CDP command; returns JSON result
-                                    e.g. evalraw <t> "DOM.getDocument" '{}'
-  open  [url]                       Open a new tab (default: about:blank)
-                                    Note: each new tab triggers a fresh "Allow debugging?" prompt
+  eval  <target> <expr>             Evaluate JS expression (top frame, returnByValue)
+  shot  <target> [file]             Screenshot (default screenshot-<target>.png in runtime dir); prints DPR mapping
+  html  <target> [selector]         Full or selector-scoped outerHTML
+  nav   <target> <url>              Navigate, wait for Page.loadEventFired + readyState=complete
+  net   <target>                    performance.getEntriesByType('resource') dump
+  click   <target> <selector>       Trusted click via Input.dispatchMouseEvent
+  clickxy <target> <x> <y>          Trusted click at CSS pixel coords
+  type    <target> <text>           Input.insertText at focus (works in cross-origin iframes)
+  loadall <target> <selector> [ms]  Repeat-click until selector disappears (default 1500ms, 5min cap)
+  evalraw <target> <method> [json]  Raw CDP method passthrough; returns JSON
+  open  [url] [--window|-w]         New tab (default about:blank). --window/-w opens a new browser
+                                    window so tab activation doesn't steal focus. New targets trigger
+                                    a fresh "Allow debugging?" prompt on first access.
   stop  [target]                    Stop daemon(s)
 
-<target> is a unique targetId prefix from "cdp list". If a prefix is ambiguous,
-use more characters.
+<target> is a unique targetId prefix from "cdp list". Use more chars to disambiguate.
 
-COORDINATE SYSTEM
-  shot captures the viewport at the device's native resolution.
-  The screenshot image size = CSS pixels × DPR (device pixel ratio).
-  For CDP Input events (clickxy, etc.) you need CSS pixels, not image pixels.
+Coordinates. Screenshot pixels = CSS pixels × DPR. CDP Input events take CSS pixels.
+CSS px = screenshot px / DPR. shot prints the conversion for the current page.
 
-    CSS pixels = screenshot image pixels / DPR
+Eval pitfall. Across multiple eval calls, avoid querySelectorAll(...)[i] when the list
+can change (e.g. clicking Ignore buttons on a feed shifts indices). Use stable selectors
+or collect everything in one eval.
 
-  shot prints the DPR and an example conversion for the current page.
-  Typical Retina (DPR=2): CSS px ≈ screenshot px × 0.5
-  If your viewer rescales the image further, account for that scaling too.
-
-EVAL SAFETY NOTE
-  Avoid index-based DOM selection (querySelectorAll(...)[i]) across multiple
-  eval calls when the list can change between calls (e.g. after clicking
-  "Ignore" buttons on a feed — indices shift). Prefer stable selectors or
-  collect all data in a single eval.
-
-DAEMON IPC (for advanced use / scripting)
-  Each tab runs a persistent daemon at Unix socket in the runtime dir (see below).
-  Protocol: newline-delimited JSON (one JSON object per line, UTF-8).
-    Request:  {"id":<number>, "cmd":"<command>", "args":["arg1","arg2",...]}
-    Response: {"id":<number>, "ok":true,  "result":"<string>"}
-           or {"id":<number>, "ok":false, "error":"<message>"}
-  Commands mirror the CLI: snap, eval, shot, html, nav, net, click, clickxy,
-  type, loadall, evalraw, stop. Use evalraw to send arbitrary CDP methods.
-  The socket disappears after 20 min of inactivity or when the tab closes.
+Daemon IPC. Per-tab Unix socket in the runtime dir. NDJSON wire format:
+  Request:  {"id":<n>,"cmd":"<command>","args":[...]}
+  Response: {"id":<n>,"ok":true,"result":"<string>"} | {"id":<n>,"ok":false,"error":"<msg>"}
+Commands mirror the CLI. Socket disappears on idle (CDP_IDLE_MS) or tab close.
 `;
 
 const NEEDS_TARGET = new Set([
-  'snap','snapshot','eval','shot','screenshot','html','nav','navigate',
-  'net','network','click','clickxy','type','loadall','evalraw',
+  'snap','eval','shot','html','nav','net','click','clickxy','type','loadall','evalraw',
 ]);
 
 async function main() {
   const [cmd, ...args] = process.argv.slice(2);
 
-  // Daemon mode (internal)
   if (cmd === '_daemon') { await runDaemon(args[0]); return; }
 
   if (!cmd || cmd === 'help' || cmd === '--help' || cmd === '-h') {
     console.log(USAGE); process.exit(0);
   }
 
-  if (cmd === 'list' || cmd === 'ls') {
+  if (cmd === 'list') {
     const cdp = new CDP();
     await cdp.connect(getWsUrl());
     const pages = await getPages(cdp);
@@ -800,31 +659,25 @@ async function main() {
     return;
   }
 
-  // Open new tab
+  // --window/-w opens a separate browser window so tab activation doesn't steal focus
   if (cmd === 'open') {
-    const url = args[0] || 'about:blank';
+    const newWindow = args.includes('--window') || args.includes('-w');
+    const url = args.find(a => a !== '--window' && a !== '-w') || 'about:blank';
     const cdp = new CDP();
     await cdp.connect(getWsUrl());
-    const { targetId } = await cdp.send('Target.createTarget', { url });
-    // Refresh cache; new tab may not appear in getTargets immediately, so add it manually
+    const { targetId } = await cdp.send('Target.createTarget', newWindow ? { url, newWindow: true } : { url });
+    // New tab may not appear in getTargets immediately; insert manually
     const pages = await getPages(cdp);
-    if (!pages.some(p => p.targetId === targetId)) {
-      pages.push({ targetId, title: url, url });
-    }
+    if (!pages.some(p => p.targetId === targetId)) pages.push({ targetId, title: url, url });
     cdp.close();
     writeFileSync(PAGES_CACHE, JSON.stringify(pages), { mode: 0o600 });
-    console.log(`Opened new tab: ${targetId.slice(0, 8)}  ${url}`);
-    console.log('Note: this tab will need "Allow debugging?" approval on first access.');
+    console.log(`Opened ${newWindow ? 'new window' : 'new tab'}: ${targetId.slice(0, 8)}  ${url}`);
+    console.log('Note: this target will need "Allow debugging?" approval on first access.');
     return;
   }
 
-  // Stop
-  if (cmd === 'stop') {
-    await stopDaemons(args[0]);
-    return;
-  }
+  if (cmd === 'stop') { await stopDaemons(args[0]); return; }
 
-  // Page commands — need target prefix
   if (!NEEDS_TARGET.has(cmd)) {
     console.error(`Unknown command: ${cmd}\n`);
     console.log(USAGE);
@@ -837,7 +690,6 @@ async function main() {
     process.exit(1);
   }
 
-  // Resolve prefix → full targetId from pages cache
   if (!existsSync(PAGES_CACHE)) {
     console.error('No page list cached. Run "cdp list" first.');
     process.exit(1);
@@ -849,22 +701,16 @@ async function main() {
 
   const cmdArgs = args.slice(1);
 
-  if (cmd === 'eval') {
-    const expr = cmdArgs.join(' ');
-    if (!expr) { console.error('Error: expression required'); process.exit(1); }
-    cmdArgs[0] = expr;
-  } else if (cmd === 'type') {
-    // Join all remaining args as text (allows spaces)
-    const text = cmdArgs.join(' ');
-    if (!text) { console.error('Error: text required'); process.exit(1); }
-    cmdArgs[0] = text;
+  if (cmd === 'eval' || cmd === 'type') {
+    const joined = cmdArgs.join(' ');
+    if (!joined) { console.error(`Error: ${cmd === 'eval' ? 'expression' : 'text'} required`); process.exit(1); }
+    cmdArgs[0] = joined;
   } else if (cmd === 'evalraw') {
-    // args: [method, ...jsonParts] — join json parts in case of spaces
     if (!cmdArgs[0]) { console.error('Error: CDP method required'); process.exit(1); }
     if (cmdArgs.length > 2) cmdArgs[1] = cmdArgs.slice(1).join(' ');
   }
 
-  if ((cmd === 'nav' || cmd === 'navigate') && !cmdArgs[0]) {
+  if (cmd === 'nav' && !cmdArgs[0]) {
     console.error('Error: URL required');
     process.exit(1);
   }
