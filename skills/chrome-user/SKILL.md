@@ -77,13 +77,13 @@ Multiple iframes share origin: `Page.getFrameTree` on session, match URL → `fr
 
 Recipe stalls when: `executionContextCreated` fires before subscription (subscribe before `Page.enable`, or `Page.reload` after); iframe is same-site cross-origin not OOPIF; `context.origin` includes path
 
-File chooser. Native OS dialogs not clickable. Reliable: Node WS script — connect, `Page.enable`, listen `Page.fileChooserOpened`, respond `Page.handleFileChooser {action:"accept", files:[path]}`. WS URL from `~/.config/vivaldi/DevToolsActivePort`. `Target.attachToTarget {flatten:true}` for sessionId
+File chooser. Native OS dialogs not clickable. `Page.handleFileChooser` no longer exists in CDP. Input already in DOM (even hidden) → set files directly, no dialog, no race:
+```
+cdp evalraw $T DOM.getDocument '{}'                                           # root nodeId, always 1
+cdp evalraw $T DOM.querySelector '{"nodeId":1,"selector":"input[type=file]"}'  # → nodeId
+cdp evalraw $T DOM.setFileInputFiles '{"nodeId":<id>,"files":["/abs/path"]}'
+```
 
-Inline race-prone version (works if shell sleep beats event):
-```
-cdp evalraw $T Page.setInterceptFileChooserDialog '{"enabled":true}'
-# click trigger
-cdp evalraw $T Page.handleFileChooser '{"action":"accept","files":["/path/to/file"]}'
-```
+Input created only on click → Node WS script: `Target.attachToTarget {flatten:true}`, `Page.enable` + `DOM.enable` on sessionId, `Page.setInterceptFileChooserDialog {enabled:true}`, click trigger via `Runtime.evaluate {userGesture:true}`, read `backendNodeId` from `Page.fileChooserOpened`, then `DOM.setFileInputFiles {backendNodeId, files:[path]}`. WS URL from `~/.config/vivaldi/DevToolsActivePort`
 
 Gmail web UI (Simplify, bulk delete, attachment download via cookies, thread expansion) → gmail-cdp skill. Official Gmail API → gmail-api skill
