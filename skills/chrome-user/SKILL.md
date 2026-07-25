@@ -79,11 +79,11 @@ Recipe stalls when: `executionContextCreated` fires before subscription (subscri
 
 File chooser. Native OS dialogs not clickable. `Page.handleFileChooser` no longer exists in CDP. Input already in DOM (even hidden) → set files directly, no dialog, no race:
 ```
-cdp evalraw $T DOM.getDocument '{}'                                           # root nodeId, always 1
+cdp evalraw $T DOM.getDocument '{}'                                          # root nodeId, always 1
 cdp evalraw $T DOM.querySelector '{"nodeId":1,"selector":"input[type=file]"}'  # → nodeId
 cdp evalraw $T DOM.setFileInputFiles '{"nodeId":<id>,"files":["/abs/path"]}'
 ```
 
 Input created only on click → Node WS script: `Target.attachToTarget {flatten:true}`, `Page.enable` + `DOM.enable` on sessionId, `Page.setInterceptFileChooserDialog {enabled:true}`, click trigger via `Runtime.evaluate {userGesture:true}`, read `backendNodeId` from `Page.fileChooserOpened`, then `DOM.setFileInputFiles {backendNodeId, files:[path]}`. WS URL from `~/.config/vivaldi/DevToolsActivePort`
 
-Gmail web UI (Simplify, bulk delete, attachment download via cookies, thread expansion) → gmail-cdp skill. Official Gmail API → gmail-api skill
+Gmail API (no browser) → gmail-api skill. Google Docs → chrome-user-google-doc skill
