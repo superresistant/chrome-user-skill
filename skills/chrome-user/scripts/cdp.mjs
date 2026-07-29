@@ -4,7 +4,7 @@
 // once per daemon. Daemon self-cleans on tab close and browser exit;
 // IDLE_TIMEOUT is the backstop. CDP_IDLE_MS overrides (ms); =0 disables.
 
-import { readFileSync, writeFileSync, unlinkSync, existsSync, mkdirSync } from 'fs';
+import { readFileSync, writeFileSync, unlinkSync, existsSync, mkdirSync, statSync } from 'fs';
 import { homedir } from 'os';
 import { resolve } from 'path';
 import { spawn } from 'child_process';
@@ -20,6 +20,11 @@ const IDLE_TIMEOUT = (() => {
   if (n === 0) return null; // disabled
   if (!Number.isFinite(n) || n < 1000) return DEFAULT_IDLE;
   return n;
+})();
+// Daemons keep serving after the script is upgraded; the stamp lets a stale one
+// retire itself instead of answering with its old command set and timeouts
+const BUILD = (() => {
+  try { const s = statSync(import.meta.filename); return `${Math.floor(s.mtimeMs)}-${s.size}`; } catch { return 'unknown'; }
 })();
 const DAEMON_CONNECT_RETRIES = 20;
 const DAEMON_CONNECT_DELAY = 300;
@@ -272,25 +277,39 @@ async function evalStr(cdp, sid, expression) {
   return typeof val === 'object' ? JSON.stringify(val, null, 2) : String(val ?? '');
 }
 
-async function wakeStr(cdp, sid) {
-  // Background tabs report hasFocus()=false, visibilityState=hidden and throttle
-  // timers/rAF to ~1Hz. Both commands lift that without raising the window.
+async function wakeStr(cdp, sid, off = false) {
+  if (off) {
+    try { await cdp.send('Page.stopScreencast', {}, sid); } catch {}
+    await cdp.send('Emulation.setFocusEmulationEnabled', { enabled: false }, sid);
+    return 'Focus emulation off, screencast stopped';
+  }
+  // Background tabs report hasFocus()=false, visibilityState=hidden and throttle timers.
   await cdp.send('Emulation.setFocusEmulationEnabled', { enabled: true }, sid);
   await cdp.send('Page.setWebLifecycleState', { state: 'active' }, sid);
-  return 'Focus emulated and lifecycle set active (tab stays in background)';
+  // An occluded or background window stops compositing, so rAF stalls near 1Hz even
+  // when the tab reports visible; a tiny screencast forces frame production for as
+  // long as the daemon holds the session
+  await cdp.send('Page.startScreencast', { format: 'jpeg', quality: 1, maxWidth: 64, maxHeight: 64, everyNthFrame: 1 }, sid);
+  return 'Focus emulated, lifecycle active, screencast forcing frames (tab stays in background)';
 }
 
 async function shotStr(cdp, sid, filePath, targetId, fresh = false) {
-  let dpr = fresh ? 1 : 1;
+  let dpr = 1;
+  let metrics = null;
   try {
-    const parsed = parseFloat(await evalStr(cdp, sid, 'window.devicePixelRatio'));
-    if (parsed > 0 && !fresh) dpr = parsed;
+    metrics = JSON.parse(await evalStr(cdp, sid, '({w:innerWidth,h:innerHeight,d:devicePixelRatio})'));
+    if (metrics.d > 0) dpr = metrics.d;
   } catch {}
 
-  // captureBeyondViewport forces a fresh paint of a tab Chrome stopped compositing;
-  // it also renders at CSS scale, so the DPR mapping is 1:1
-  const { data } = await cdp.send('Page.captureScreenshot',
-    fresh ? { format: 'png', captureBeyondViewport: true } : { format: 'png' }, sid);
+  // captureBeyondViewport repaints a tab Chrome stopped compositing, but without a clip
+  // it crops to the CSS-sized top-left region; clip in device pixels at scale 1 gives the
+  // same geometry as a plain shot
+  const params = { format: 'png' };
+  if (fresh && metrics) {
+    params.captureBeyondViewport = true;
+    params.clip = { x: 0, y: 0, width: Math.round(metrics.w * dpr), height: Math.round(metrics.h * dpr), scale: 1 };
+  }
+  const { data } = await cdp.send('Page.captureScreenshot', params, sid);
   const out = filePath || resolve(RUNTIME_DIR, `screenshot-${(targetId || 'unknown').slice(0, 8)}.png`);
   writeFileSync(out, Buffer.from(data, 'base64'));
 
@@ -486,8 +505,11 @@ async function runDaemon(targetId) {
   }
   if (IDLE_TIMEOUT !== null) scheduleShutdown(IDLE_TIMEOUT);
 
-  async function handleCommand({ cmd, args, timeoutMs }) {
+  async function handleCommand({ cmd, args, timeoutMs, build }) {
     resetIdle();
+    if (build && build !== BUILD && cmd !== 'stop') {
+      return { ok: false, error: 'stale daemon (cdp.mjs was upgraded); restarting', stale: true, stopAfter: true };
+    }
     cdp.timeoutMs = timeoutMs > 0 ? timeoutMs : TIMEOUT;
     try {
       let result;
@@ -505,7 +527,7 @@ async function runDaemon(targetId) {
         case 'snap': result = await snapshotStr(cdp, sessionId, true); break;
         case 'eval': result = await evalStr(cdp, sessionId, args[0]); break;
         case 'shot': result = await shotStr(cdp, sessionId, args[0], targetId, args[1] === '--fresh'); break;
-        case 'wake': result = await wakeStr(cdp, sessionId); break;
+        case 'wake': result = await wakeStr(cdp, sessionId, args[0] === '--off'); break;
         case 'html': result = await htmlStr(cdp, sessionId, args[0]); break;
         case 'nav': result = await navStr(cdp, sessionId, args[0]); break;
         case 'net': result = await netStr(cdp, sessionId); break;
@@ -664,13 +686,14 @@ Usage: cdp <command> [args]
                                     or add a win= column grouped by window
   window <target>                   windowId + bounds of the window holding this tab
   close  <target>                   Close tab
-  wake   <target>                   Focus emulation + active lifecycle: background tab reports
-                                    hasFocus()/visible, takes key events, stops throttling rAF
+  wake   <target> [--off]           Focus emulation + active lifecycle + tiny screencast: background
+                                    tab reports hasFocus()/visible, takes key events, keeps timers and
+                                    rAF running; --off reverts
   snap  <target>                    Accessibility tree snapshot
   eval  <target> <expr>             Evaluate JS expression (top frame, returnByValue)
   shot  <target> [file] [--fresh]   Screenshot (default screenshot-<target>.png in runtime dir); prints DPR
-                                    mapping. --fresh forces a repaint of an uncomposited background tab
-                                    (captureBeyondViewport, renders at CSS scale so DPR mapping is 1:1)
+                                    mapping. --fresh repaints an uncomposited background tab
+                                    (captureBeyondViewport with a device-pixel clip; same geometry)
   html  <target> [selector]         Full or selector-scoped outerHTML
   nav   <target> <url>              Navigate, wait for Page.loadEventFired + readyState=complete
   net   <target>                    performance.getEntriesByType('resource') dump
@@ -834,7 +857,11 @@ async function main() {
   }
 
   const envTimeout = Number(process.env.CDP_TIMEOUT_MS);
-  const response = await sendCommand(conn, { cmd, args: cmdArgs, timeoutMs: envTimeout > 0 ? envTimeout : undefined });
+  const req = { cmd, args: cmdArgs, build: BUILD, timeoutMs: envTimeout > 0 ? envTimeout : undefined };
+  let response = await sendCommand(conn, req);
+  if (!response.ok && response.stale) {
+    response = await sendCommand(await getOrStartTabDaemon(targetId), req);
+  }
 
   if (response.ok) {
     if (response.result) console.log(response.result);
