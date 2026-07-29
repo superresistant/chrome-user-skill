@@ -5,16 +5,18 @@ description: user's Chrome via DevTools
 
 Env: Linux + Vivaldi launched via `~/.local/bin/vivaldi-debug` (port=0, remote-allow-origins=*, modal-bypassed). Runtime files in `$XDG_RUNTIME_DIR/cdp/` (`pages.json`, daemon sockets, default screenshots)
 
-CDP CLI at `~/.pi/agent/skills/chrome-user/scripts/cdp.mjs`. Set `CDP=<full-path>`, then `node $CDP <cmd>`. Node 22+. Never `alias cdp=...` (no bash -c expansion). Run `cdp` with no args for 14-command help
+CDP CLI at `~/.pi/agent/skills/chrome-user/scripts/cdp.mjs`. Set `CDP=<full-path>`, then `node $CDP <cmd>`. Node 22+. Never `alias cdp=...` (no bash -c expansion). Run `cdp` with no args for 16-command help. Per-command deadline 15s, shorten with `CDP_TIMEOUT_MS=<ms>` when probing tabs that may be dead
 
 Agent window. User keeps a dedicated window for agent ops so tab activations don't steal focus from their working window. Discover at session start:
 ```
 eval "$(node ~/.pi/agent/skills/chrome-user/scripts/discover-agent-window.mjs)"
-# exports AGENT_WINDOW_ID, AGENT_SEED_TAB, AGENT_WINDOW_TAB_COUNT
+# exports AGENT_WINDOW_ID, AGENT_SEED_TAB, AGENT_SEED_BLANK, AGENT_WINDOW_TAB_COUNT
 ```
-Heuristic: window with fewest tabs (gap-checked). Seed tab matches `about:blank`, `example.com`, or `localhost:*`. Navigate seed: `cdp nav $AGENT_SEED_TAB <url>`. Add tab to agent window: `cdp evalraw <any-target> Target.createTarget '{"url":"...","windowId":<AGENT_WINDOW_ID>}'`. Never `cdp open <url>` without `--window` — adds to user's main window
+Heuristic: window with fewest tabs (gap-checked). `AGENT_SEED_BLANK=1` means seed matches `about:blank`/`example.com`/`localhost:*` and `cdp nav $AGENT_SEED_TAB <url>` is safe; `=0` means the seed is a real user page — never nav it, open your own tab
 
-TargetIds and windowIds change every restart. Re-run discovery, never persist. Discovery exits 1 when only one window exists — bootstrap with `cdp open about:blank --window`, then re-run
+Add tab to agent window: `cdp open <url> --in $AGENT_SEED_TAB`. `Target.createTarget` has NO `windowId` param (silently ignored, tab lands in the user's main window); `--in` works because it calls `window.open(url,"_blank")` with `userGesture:true` from a tab already in that window. Never `cdp open <url>` without `--window` or `--in`. List agent-window tabs: `cdp list --window $AGENT_WINDOW_ID`. Window of a tab: `cdp window <target>`. Clean up: `cdp close <target>`
+
+TargetIds and windowIds change every restart. Re-run discovery, never persist. Discovery exits 1 when only one window exists — bootstrap with `cdp open about:blank --window`, then re-run. Prefix misses auto-refresh the page cache, so tabs created outside `cdp open` still resolve
 
 Daemon lifetime. Per-tab daemon attached while IPC is active. Idle shutdown via `IDLE_TIMEOUT` (default 30 days); override with `CDP_IDLE_MS=<ms>`, disable with `CDP_IDLE_MS=0`. Self-cleans on tab close and browser exit; idle timer is backstop. Dead daemon → next call re-attaches WS, fine with launch-flag bypass, otherwise re-fires consent modal
 
@@ -49,7 +51,7 @@ Trusted click on text-matched element: mark via eval, click by attribute
 node $CDP click $T '[data-cdp-target]'
 ```
 
-Eval pitfalls. Errors surface as `Error: Uncaught` with no detail when JS throws or return is non-serializable. Return primitives or plain objects, never DOM nodes. Complex eval fails → split to localize. Top-frame context only; same-origin iframe via `iframe.contentDocument` traversal, cross-origin via recipe below
+Eval pitfalls. `cdp eval` sets `awaitPromise`, so an async expression blocks the 15s deadline instead of returning; for long work store the result on `window` and poll. Errors surface as `Error: Uncaught` with no detail when JS throws or return is non-serializable. Return primitives or plain objects, never DOM nodes. Complex eval fails → split to localize. Top-frame context only; same-origin iframe via `iframe.contentDocument` traversal, cross-origin via recipe below
 
 Console history not retroactive. `console.error` calls before eval ran are unreadable. Either subscribe via `cdp evalraw $T Runtime.consoleAPICalled` (persistent WS), or monkey-patch on first call:
 ```
@@ -72,6 +74,8 @@ Recipe (Node WS):
 7. `Runtime.evaluate {expression, contextId, awaitPromise:true, returnByValue:true}` on sessionId
 
 Multiple iframes share origin: `Page.getFrameTree` on session, match URL → `frameId`, cross-ref with `context.auxData.frameId`
+
+Private Network Access: an https page fetching `http://127.0.0.1` hangs until timeout instead of rejecting — a local bridge looks like a dead server. Probe from an http/localhost page or curl it from the shell
 
 `fetch('/api/...', {credentials:'include'})` inside iframe inherits iframe cookies/origin. Page SPA HTTP interceptor does NOT run — no anti-CSRF, no correlation IDs, no retry-on-401. Mutating endpoints often 400/403. Read token from `document.cookie` (e.g. `XSRF-TOKEN`), `sessionStorage`, or SPA state, add header manually. GET usually works without
 

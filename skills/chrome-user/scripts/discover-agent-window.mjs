@@ -1,8 +1,9 @@
 #!/usr/bin/env node
 // Discover user's agent window. Prints AGENT_WINDOW_ID, AGENT_SEED_TAB,
-// AGENT_WINDOW_TAB_COUNT as shell-evalable assignments. Exit 1 if only one
-// window. Heuristic: window with fewest page tabs; seed prefers
-// about:blank|example.com|localhost|127.0.0.1.
+// AGENT_SEED_BLANK, AGENT_WINDOW_TAB_COUNT as shell-evalable assignments. Exit 1
+// if only one window. Heuristic: window with fewest page tabs; seed prefers
+// about:blank|example.com|localhost|127.0.0.1. AGENT_SEED_BLANK=0 means the seed
+// is a real user page — open a tab instead of navigating it.
 
 import { readFileSync } from 'fs';
 import { homedir } from 'os';
@@ -78,8 +79,10 @@ try {
     process.exit(1);
   }
 
-  const seed = agentTabs.find((t) => t.url && SEED_RE.test(t.url)) || agentTabs[0];
-  process.stdout.write(`AGENT_WINDOW_ID=${agentWid}\nAGENT_SEED_TAB=${seed.targetId.slice(0, 8)}\nAGENT_WINDOW_TAB_COUNT=${agentTabs.length}\n`);
+  const blank = agentTabs.find((t) => t.url && SEED_RE.test(t.url));
+  const seed = blank || agentTabs[0];
+  if (!blank) process.stderr.write(`seed tab is a real page (${seed.url}) — do not navigate it, use: cdp open <url> --in ${seed.targetId.slice(0, 8)}\n`);
+  process.stdout.write(`AGENT_WINDOW_ID=${agentWid}\nAGENT_SEED_TAB=${seed.targetId.slice(0, 8)}\nAGENT_SEED_BLANK=${blank ? 1 : 0}\nAGENT_WINDOW_TAB_COUNT=${agentTabs.length}\n`);
 } catch (e) {
   process.stderr.write(`discover-agent-window: ${e.message}\n`);
   process.exit(2);

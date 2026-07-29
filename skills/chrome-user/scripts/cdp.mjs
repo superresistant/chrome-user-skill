@@ -10,7 +10,7 @@ import { resolve } from 'path';
 import { spawn } from 'child_process';
 import net from 'net';
 
-const TIMEOUT = 15000;
+const TIMEOUT = Number(process.env.CDP_TIMEOUT_MS) > 0 ? Number(process.env.CDP_TIMEOUT_MS) : 15000;
 const NAVIGATION_TIMEOUT = 30000;
 const DEFAULT_IDLE = 30 * 24 * 60 * 60 * 1000; // 30 days
 const IDLE_TIMEOUT = (() => {
@@ -167,6 +167,30 @@ async function getPages(cdp) {
   return targetInfos.filter(t => t.type === 'page' && !t.url.startsWith('chrome://'));
 }
 
+async function withBrowser(fn) {
+  const cdp = new CDP();
+  await cdp.connect(getWsUrl());
+  try { return await fn(cdp); } finally { cdp.close(); }
+}
+
+async function refreshPages(cdp) {
+  const pages = await getPages(cdp);
+  writeFileSync(PAGES_CACHE, JSON.stringify(pages), { mode: 0o600 });
+  return pages;
+}
+
+async function resolveTargetId(prefix) {
+  if (!prefix) throw new Error('target ID required. Run "cdp list" first.');
+  const cached = existsSync(PAGES_CACHE) ? JSON.parse(readFileSync(PAGES_CACHE, 'utf8')) : [];
+  try {
+    return resolvePrefix(prefix, cached.map(p => p.targetId), 'target', 'Run "cdp list".');
+  } catch (e) {
+    if (e.message.startsWith('Ambiguous')) throw e;
+  }
+  const pages = await withBrowser(refreshPages);
+  return resolvePrefix(prefix, pages.map(p => p.targetId), 'target', 'Run "cdp list".');
+}
+
 function formatPageList(pages) {
   const prefixLen = getDisplayPrefixLength(pages.map(p => p.targetId));
   return pages.map(p => {
@@ -218,9 +242,17 @@ async function snapshotStr(cdp, sid, compact = false) {
 
 async function evalStr(cdp, sid, expression) {
   await cdp.send('Runtime.enable', {}, sid);
-  const result = await cdp.send('Runtime.evaluate', {
-    expression, returnByValue: true, awaitPromise: true,
-  }, sid);
+  let result;
+  try {
+    result = await cdp.send('Runtime.evaluate', {
+      expression, returnByValue: true, awaitPromise: true,
+    }, sid);
+  } catch (e) {
+    if (e.message.startsWith('Timeout')) {
+      throw new Error(`${e.message} — awaitPromise blocks until the promise settles; unsettled promise or unresponsive tab. Store the result on window and poll, or raise CDP_TIMEOUT_MS`);
+    }
+    throw e;
+  }
   if (result.exceptionDetails) {
     throw new Error(result.exceptionDetails.text || result.exceptionDetails.exception?.description);
   }
@@ -603,7 +635,9 @@ const USAGE = `cdp - Chrome DevTools Protocol CLI (no Puppeteer, Node 22+)
 
 Usage: cdp <command> [args]
 
-  list                              List open pages with unique targetId prefixes
+  list  [--window <id>]             List open pages with unique targetId prefixes; filter by windowId
+  window <target>                   windowId + bounds of the window holding this tab
+  close  <target>                   Close tab
   snap  <target>                    Accessibility tree snapshot
   eval  <target> <expr>             Evaluate JS expression (top frame, returnByValue)
   shot  <target> [file]             Screenshot (default screenshot-<target>.png in runtime dir); prints DPR mapping
@@ -616,11 +650,14 @@ Usage: cdp <command> [args]
   loadall <target> <selector> [ms]  Repeat-click until selector disappears (default 1500ms, 5min cap)
   evalraw <target> <method> [json]  Raw CDP method passthrough; returns JSON
   open  [url] [--window|-w]         New tab (default about:blank). --window/-w opens a new browser
-                                    window so tab activation doesn't steal focus. New targets trigger
-                                    a fresh "Allow debugging?" prompt on first access.
+        [--in <target>]             window so tab activation doesn't steal focus; --in puts the tab in
+                                    the same window as <target>. New targets trigger a fresh
+                                    "Allow debugging?" prompt on first access.
   stop  [target]                    Stop daemon(s)
 
 <target> is a unique targetId prefix from "cdp list". Use more chars to disambiguate.
+The page cache auto-refreshes when a prefix misses, so tabs opened after the last list resolve.
+Per-command deadline is 15s; CDP_TIMEOUT_MS=<ms> shortens it for probing dead tabs.
 
 Coordinates. Screenshot pixels = CSS pixels × DPR. CDP Input events take CSS pixels.
 CSS px = screenshot px / DPR. shot prints the conversion for the current page.
@@ -649,29 +686,74 @@ async function main() {
   }
 
   if (cmd === 'list') {
-    const cdp = new CDP();
-    await cdp.connect(getWsUrl());
-    const pages = await getPages(cdp);
-    cdp.close();
-    writeFileSync(PAGES_CACHE, JSON.stringify(pages), { mode: 0o600 });
-    console.log(formatPageList(pages));
+    const wIdx = args.findIndex(a => a === '--window');
+    const windowId = wIdx >= 0 ? Number(args[wIdx + 1]) : null;
+    await withBrowser(async (cdp) => {
+      let pages = await refreshPages(cdp);
+      if (windowId !== null) {
+        const kept = [];
+        for (const p of pages) {
+          try {
+            const { windowId: w } = await cdp.send('Browser.getWindowForTarget', { targetId: p.targetId });
+            if (w === windowId) kept.push(p);
+          } catch {}
+        }
+        pages = kept;
+      }
+      console.log(formatPageList(pages));
+    });
     setTimeout(() => process.exit(0), 100);
+    return;
+  }
+
+  if (cmd === 'close') {
+    const targetId = await resolveTargetId(args[0]);
+    await withBrowser(async (cdp) => {
+      await cdp.send('Target.closeTarget', { targetId });
+      await sleep(300);
+      await refreshPages(cdp);
+    });
+    console.log(`Closed ${targetId.slice(0, 8)}`);
+    return;
+  }
+
+  if (cmd === 'window') {
+    const targetId = await resolveTargetId(args[0]);
+    const { windowId, bounds } = await withBrowser(cdp => cdp.send('Browser.getWindowForTarget', { targetId }));
+    console.log(`windowId=${windowId} ${bounds.width}x${bounds.height}+${bounds.left}+${bounds.top} ${bounds.windowState}`);
     return;
   }
 
   // --window/-w opens a separate browser window so tab activation doesn't steal focus
   if (cmd === 'open') {
     const newWindow = args.includes('--window') || args.includes('-w');
-    const url = args.find(a => a !== '--window' && a !== '-w') || 'about:blank';
-    const cdp = new CDP();
-    await cdp.connect(getWsUrl());
-    const { targetId } = await cdp.send('Target.createTarget', newWindow ? { url, newWindow: true } : { url });
-    // New tab may not appear in getTargets immediately; insert manually
-    const pages = await getPages(cdp);
-    if (!pages.some(p => p.targetId === targetId)) pages.push({ targetId, title: url, url });
-    cdp.close();
-    writeFileSync(PAGES_CACHE, JSON.stringify(pages), { mode: 0o600 });
-    console.log(`Opened ${newWindow ? 'new window' : 'new tab'}: ${targetId.slice(0, 8)}  ${url}`);
+    const inIdx = args.indexOf('--in');
+    const inTarget = inIdx >= 0 ? args[inIdx + 1] : null;
+    const url = args.find((a, i) => !a.startsWith('-') && i !== inIdx + 1) || 'about:blank';
+
+    // Target.createTarget has no windowId parameter; window.open from a tab already
+    // in that window is the only way to place a tab in a specific window
+    if (inTarget) {
+      const hostId = await resolveTargetId(inTarget);
+      const before = new Set((await withBrowser(refreshPages)).map(p => p.targetId));
+      const conn = await getOrStartTabDaemon(hostId);
+      const res = await sendCommand(conn, { cmd: 'evalraw', args: ['Runtime.evaluate',
+        JSON.stringify({ expression: `window.open(${JSON.stringify(url)}, '_blank')`, userGesture: true })] });
+      if (!res.ok) { console.error('Error:', res.error); process.exit(1); }
+      await sleep(500);
+      const opened = (await withBrowser(refreshPages)).find(p => !before.has(p.targetId));
+      console.log(`Opened tab in window of ${hostId.slice(0, 8)}: ${opened ? opened.targetId.slice(0, 8) : '(run cdp list)'}  ${url}`);
+      return;
+    }
+
+    await withBrowser(async (cdp) => {
+      const { targetId } = await cdp.send('Target.createTarget', newWindow ? { url, newWindow: true } : { url });
+      // New tab may not appear in getTargets immediately; insert manually
+      const pages = await getPages(cdp);
+      if (!pages.some(p => p.targetId === targetId)) pages.push({ targetId, title: url, url });
+      writeFileSync(PAGES_CACHE, JSON.stringify(pages), { mode: 0o600 });
+      console.log(`Opened ${newWindow ? 'new window' : 'new tab'}: ${targetId.slice(0, 8)}  ${url}`);
+    });
     console.log('Note: this target will need "Allow debugging?" approval on first access.');
     return;
   }
@@ -690,12 +772,7 @@ async function main() {
     process.exit(1);
   }
 
-  if (!existsSync(PAGES_CACHE)) {
-    console.error('No page list cached. Run "cdp list" first.');
-    process.exit(1);
-  }
-  const pages = JSON.parse(readFileSync(PAGES_CACHE, 'utf8'));
-  const targetId = resolvePrefix(targetPrefix, pages.map(p => p.targetId), 'target', 'Run "cdp list".');
+  const targetId = await resolveTargetId(targetPrefix);
 
   const conn = await getOrStartTabDaemon(targetId);
 
