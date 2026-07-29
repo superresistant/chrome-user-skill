@@ -77,6 +77,7 @@ function getDisplayPrefixLength(targetIds) {
 
 class CDP {
   #ws; #id = 0; #pending = new Map(); #eventHandlers = new Map(); #closeHandlers = [];
+  timeoutMs = TIMEOUT; // per-command deadline, overridable per IPC request
 
   async connect(wsUrl) {
     return new Promise((res, rej) => {
@@ -112,7 +113,7 @@ class CDP {
           this.#pending.delete(id);
           reject(new Error(`Timeout: ${method}`));
         }
-      }, TIMEOUT);
+      }, this.timeoutMs);
     });
   }
 
@@ -196,8 +197,19 @@ function formatPageList(pages) {
   return pages.map(p => {
     const id = p.targetId.slice(0, prefixLen).padEnd(prefixLen);
     const title = p.title.substring(0, 54).padEnd(54);
-    return `${id}  ${title}  ${p.url}`;
+    const win = p.windowId ? `win=${p.windowId}  ` : '';
+    return `${id}  ${win}${title}  ${p.url}`;
   }).join('\n');
+}
+
+async function annotateWindows(cdp, pages) {
+  for (const p of pages) {
+    try {
+      const { windowId } = await cdp.send('Browser.getWindowForTarget', { targetId: p.targetId });
+      p.windowId = windowId;
+    } catch {}
+  }
+  return pages;
 }
 
 async function snapshotStr(cdp, sid, compact = false) {
@@ -260,14 +272,25 @@ async function evalStr(cdp, sid, expression) {
   return typeof val === 'object' ? JSON.stringify(val, null, 2) : String(val ?? '');
 }
 
-async function shotStr(cdp, sid, filePath, targetId) {
-  let dpr = 1;
+async function wakeStr(cdp, sid) {
+  // Background tabs report hasFocus()=false, visibilityState=hidden and throttle
+  // timers/rAF to ~1Hz. Both commands lift that without raising the window.
+  await cdp.send('Emulation.setFocusEmulationEnabled', { enabled: true }, sid);
+  await cdp.send('Page.setWebLifecycleState', { state: 'active' }, sid);
+  return 'Focus emulated and lifecycle set active (tab stays in background)';
+}
+
+async function shotStr(cdp, sid, filePath, targetId, fresh = false) {
+  let dpr = fresh ? 1 : 1;
   try {
     const parsed = parseFloat(await evalStr(cdp, sid, 'window.devicePixelRatio'));
-    if (parsed > 0) dpr = parsed;
+    if (parsed > 0 && !fresh) dpr = parsed;
   } catch {}
 
-  const { data } = await cdp.send('Page.captureScreenshot', { format: 'png' }, sid);
+  // captureBeyondViewport forces a fresh paint of a tab Chrome stopped compositing;
+  // it also renders at CSS scale, so the DPR mapping is 1:1
+  const { data } = await cdp.send('Page.captureScreenshot',
+    fresh ? { format: 'png', captureBeyondViewport: true } : { format: 'png' }, sid);
   const out = filePath || resolve(RUNTIME_DIR, `screenshot-${(targetId || 'unknown').slice(0, 8)}.png`);
   writeFileSync(out, Buffer.from(data, 'base64'));
 
@@ -463,8 +486,9 @@ async function runDaemon(targetId) {
   }
   if (IDLE_TIMEOUT !== null) scheduleShutdown(IDLE_TIMEOUT);
 
-  async function handleCommand({ cmd, args }) {
+  async function handleCommand({ cmd, args, timeoutMs }) {
     resetIdle();
+    cdp.timeoutMs = timeoutMs > 0 ? timeoutMs : TIMEOUT;
     try {
       let result;
       switch (cmd) {
@@ -480,7 +504,8 @@ async function runDaemon(targetId) {
         }
         case 'snap': result = await snapshotStr(cdp, sessionId, true); break;
         case 'eval': result = await evalStr(cdp, sessionId, args[0]); break;
-        case 'shot': result = await shotStr(cdp, sessionId, args[0], targetId); break;
+        case 'shot': result = await shotStr(cdp, sessionId, args[0], targetId, args[1] === '--fresh'); break;
+        case 'wake': result = await wakeStr(cdp, sessionId); break;
         case 'html': result = await htmlStr(cdp, sessionId, args[0]); break;
         case 'nav': result = await navStr(cdp, sessionId, args[0]); break;
         case 'net': result = await netStr(cdp, sessionId); break;
@@ -635,12 +660,17 @@ const USAGE = `cdp - Chrome DevTools Protocol CLI (no Puppeteer, Node 22+)
 
 Usage: cdp <command> [args]
 
-  list  [--window <id>]             List open pages with unique targetId prefixes; filter by windowId
+  list  [--window <id>|--windows]   List open pages with unique targetId prefixes; filter by windowId
+                                    or add a win= column grouped by window
   window <target>                   windowId + bounds of the window holding this tab
   close  <target>                   Close tab
+  wake   <target>                   Focus emulation + active lifecycle: background tab reports
+                                    hasFocus()/visible, takes key events, stops throttling rAF
   snap  <target>                    Accessibility tree snapshot
   eval  <target> <expr>             Evaluate JS expression (top frame, returnByValue)
-  shot  <target> [file]             Screenshot (default screenshot-<target>.png in runtime dir); prints DPR mapping
+  shot  <target> [file] [--fresh]   Screenshot (default screenshot-<target>.png in runtime dir); prints DPR
+                                    mapping. --fresh forces a repaint of an uncomposited background tab
+                                    (captureBeyondViewport, renders at CSS scale so DPR mapping is 1:1)
   html  <target> [selector]         Full or selector-scoped outerHTML
   nav   <target> <url>              Navigate, wait for Page.loadEventFired + readyState=complete
   net   <target>                    performance.getEntriesByType('resource') dump
@@ -651,13 +681,15 @@ Usage: cdp <command> [args]
   evalraw <target> <method> [json]  Raw CDP method passthrough; returns JSON
   open  [url] [--window|-w]         New tab (default about:blank). --window/-w opens a new browser
         [--in <target>]             window so tab activation doesn't steal focus; --in puts the tab in
-                                    the same window as <target>. New targets trigger a fresh
+                                    the same window as <target>, prints the bare new targetId on stdout
+                                    and re-activates the opener. New targets trigger a fresh
                                     "Allow debugging?" prompt on first access.
   stop  [target]                    Stop daemon(s)
 
 <target> is a unique targetId prefix from "cdp list". Use more chars to disambiguate.
 The page cache auto-refreshes when a prefix misses, so tabs opened after the last list resolve.
-Per-command deadline is 15s; CDP_TIMEOUT_MS=<ms> shortens it for probing dead tabs.
+Per-command deadline is 15s; CDP_TIMEOUT_MS=<ms> shortens it for probing dead tabs, and rides
+along in each IPC request so it applies to already-running daemons.
 
 Coordinates. Screenshot pixels = CSS pixels × DPR. CDP Input events take CSS pixels.
 CSS px = screenshot px / DPR. shot prints the conversion for the current page.
@@ -673,7 +705,7 @@ Commands mirror the CLI. Socket disappears on idle (CDP_IDLE_MS) or tab close.
 `;
 
 const NEEDS_TARGET = new Set([
-  'snap','eval','shot','html','nav','net','click','clickxy','type','loadall','evalraw',
+  'snap','eval','shot','html','nav','net','click','clickxy','type','loadall','evalraw','wake',
 ]);
 
 async function main() {
@@ -688,17 +720,14 @@ async function main() {
   if (cmd === 'list') {
     const wIdx = args.findIndex(a => a === '--window');
     const windowId = wIdx >= 0 ? Number(args[wIdx + 1]) : null;
+    const showWindows = args.includes('--windows');
     await withBrowser(async (cdp) => {
       let pages = await refreshPages(cdp);
-      if (windowId !== null) {
-        const kept = [];
-        for (const p of pages) {
-          try {
-            const { windowId: w } = await cdp.send('Browser.getWindowForTarget', { targetId: p.targetId });
-            if (w === windowId) kept.push(p);
-          } catch {}
-        }
-        pages = kept;
+      if (windowId !== null || showWindows) {
+        await annotateWindows(cdp, pages);
+        if (windowId !== null) pages = pages.filter(p => p.windowId === windowId);
+        if (!showWindows) for (const p of pages) delete p.windowId;
+        else pages.sort((a, b) => (a.windowId || 0) - (b.windowId || 0));
       }
       console.log(formatPageList(pages));
     });
@@ -742,7 +771,12 @@ async function main() {
       if (!res.ok) { console.error('Error:', res.error); process.exit(1); }
       await sleep(500);
       const opened = (await withBrowser(refreshPages)).find(p => !before.has(p.targetId));
-      console.log(`Opened tab in window of ${hostId.slice(0, 8)}: ${opened ? opened.targetId.slice(0, 8) : '(run cdp list)'}  ${url}`);
+      // window.open activates the new tab; hand activation back to the opener so the
+      // disruption stays inside the agent window
+      await withBrowser(cdp => cdp.send('Target.activateTarget', { targetId: hostId }));
+      process.stderr.write(`opened in window of ${hostId.slice(0, 8)}, opener re-activated: ${url}\n`);
+      console.log(opened ? opened.targetId.slice(0, 8) : '');
+      if (!opened) { console.error('New target not found; run "cdp list"'); process.exit(1); }
       return;
     }
 
@@ -787,12 +821,20 @@ async function main() {
     if (cmdArgs.length > 2) cmdArgs[1] = cmdArgs.slice(1).join(' ');
   }
 
+  if (cmd === 'shot') {
+    const fresh = cmdArgs.includes('--fresh');
+    const file = cmdArgs.find(a => a !== '--fresh');
+    cmdArgs.length = 0;
+    cmdArgs.push(file, fresh ? '--fresh' : '');
+  }
+
   if (cmd === 'nav' && !cmdArgs[0]) {
     console.error('Error: URL required');
     process.exit(1);
   }
 
-  const response = await sendCommand(conn, { cmd, args: cmdArgs });
+  const envTimeout = Number(process.env.CDP_TIMEOUT_MS);
+  const response = await sendCommand(conn, { cmd, args: cmdArgs, timeoutMs: envTimeout > 0 ? envTimeout : undefined });
 
   if (response.ok) {
     if (response.result) console.log(response.result);

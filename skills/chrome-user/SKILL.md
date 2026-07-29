@@ -5,7 +5,7 @@ description: user's Chrome via DevTools
 
 Env: Linux + Vivaldi launched via `~/.local/bin/vivaldi-debug` (port=0, remote-allow-origins=*, modal-bypassed). Runtime files in `$XDG_RUNTIME_DIR/cdp/` (`pages.json`, daemon sockets, default screenshots)
 
-CDP CLI at `~/.pi/agent/skills/chrome-user/scripts/cdp.mjs`. Set `CDP=<full-path>`, then `node $CDP <cmd>`. Node 22+. Never `alias cdp=...` (no bash -c expansion). Run `cdp` with no args for 16-command help. Per-command deadline 15s, shorten with `CDP_TIMEOUT_MS=<ms>` when probing tabs that may be dead
+CDP CLI at `~/.pi/agent/skills/chrome-user/scripts/cdp.mjs`. Set `CDP=<full-path>`, then `node $CDP <cmd>`. Node 22+. Never `alias cdp=...` (no bash -c expansion). Run `cdp` with no args for 17-command help. Per-command deadline 15s, shorten with `CDP_TIMEOUT_MS=<ms>` when probing tabs that may be dead
 
 Agent window. User keeps a dedicated window for agent ops so tab activations don't steal focus from their working window. Discover at session start:
 ```
@@ -14,7 +14,9 @@ eval "$(node ~/.pi/agent/skills/chrome-user/scripts/discover-agent-window.mjs)"
 ```
 Heuristic: window with fewest tabs (gap-checked). `AGENT_SEED_BLANK=1` means seed matches `about:blank`/`example.com`/`localhost:*` and `cdp nav $AGENT_SEED_TAB <url>` is safe; `=0` means the seed is a real user page — never nav it, open your own tab
 
-Add tab to agent window: `cdp open <url> --in $AGENT_SEED_TAB`. `Target.createTarget` has NO `windowId` param (silently ignored, tab lands in the user's main window); `--in` works because it calls `window.open(url,"_blank")` with `userGesture:true` from a tab already in that window. Never `cdp open <url>` without `--window` or `--in`. List agent-window tabs: `cdp list --window $AGENT_WINDOW_ID`. Window of a tab: `cdp window <target>`. Clean up: `cdp close <target>`
+Add tab to agent window: `NEW=$(cdp open <url> --in $AGENT_SEED_TAB)` — stdout is the bare targetId, details go to stderr. `Target.createTarget` has NO `windowId` param (silently ignored, tab lands in the user's main window); `--in` works because it calls `window.open(url,"_blank")` with `userGesture:true` from a tab already in that window, then re-activates the opener so the one unavoidable activation stays inside the agent window. Never `cdp open <url>` without `--window` or `--in`. List agent-window tabs: `cdp list --window $AGENT_WINDOW_ID`, or `cdp list --windows` for a `win=` column. Window of a tab: `cdp window <target>`. Clean up: `cdp close <target>`
+
+Background tabs. Never raise a window to make a tab work. `cdp wake <target>` = `Emulation.setFocusEmulationEnabled` + `Page.setWebLifecycleState {active}`: the tab then reports `document.hasFocus()`, applies `:focus`, accepts key events, and stops throttling timers/rAF (measured ~1 rAF/s hidden vs ~150/s after wake). For a tab Chrome stopped compositing, `cdp shot <target> [file] --fresh` forces a repaint via `captureBeyondViewport` — it renders at CSS scale, so DPR mapping is 1:1 instead of the usual divide-by-DPR. A discarded tab (renderer gone) answers nothing: every command times out and screenshots return `Internal error` — probe with `CDP_TIMEOUT_MS=2000` and `cdp nav` it back to life
 
 TargetIds and windowIds change every restart. Re-run discovery, never persist. Discovery exits 1 when only one window exists — bootstrap with `cdp open about:blank --window`, then re-run. Prefix misses auto-refresh the page cache, so tabs created outside `cdp open` still resolve
 
