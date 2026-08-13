@@ -277,6 +277,28 @@ async function evalStr(cdp, sid, expression) {
   return typeof val === 'object' ? JSON.stringify(val, null, 2) : String(val ?? '');
 }
 
+async function openBackgroundStr(cdp, sid, url) {
+  const marker = `__cdp_bgopen_${Date.now()}`;
+  await evalStr(cdp, sid, `(()=>{
+    const a=document.createElement('a');
+    a.id=${JSON.stringify(marker)};
+    a.href=${JSON.stringify(url)};
+    a.target='_blank';
+    a.rel='noopener';
+    Object.assign(a.style,{position:'fixed',left:'0',top:'0',width:'20px',height:'20px',zIndex:'2147483647',display:'block',pointerEvents:'auto'});
+    document.documentElement.append(a);
+    return true;
+  })()`);
+  try {
+    const base = { x: 10, y: 10, button: 'middle', clickCount: 1, modifiers: 0 };
+    await cdp.send('Input.dispatchMouseEvent', { ...base, type: 'mousePressed' }, sid);
+    await cdp.send('Input.dispatchMouseEvent', { ...base, type: 'mouseReleased' }, sid);
+  } finally {
+    try { await evalStr(cdp, sid, `document.getElementById(${JSON.stringify(marker)})?.remove()`); } catch {}
+  }
+  return 'Background tab requested by trusted middle-click';
+}
+
 async function wakeStr(cdp, sid, off = false) {
   if (off) {
     try { await cdp.send('Page.stopScreencast', {}, sid); } catch {}
@@ -526,6 +548,7 @@ async function runDaemon(targetId) {
         }
         case 'snap': result = await snapshotStr(cdp, sessionId, true); break;
         case 'eval': result = await evalStr(cdp, sessionId, args[0]); break;
+        case 'openbg': result = await openBackgroundStr(cdp, sessionId, args[0]); break;
         case 'shot': result = await shotStr(cdp, sessionId, args[0], targetId, args[1] === '--fresh'); break;
         case 'wake': result = await wakeStr(cdp, sessionId, args[0] === '--off'); break;
         case 'html': result = await htmlStr(cdp, sessionId, args[0]); break;
@@ -656,6 +679,16 @@ function sendCommand(conn, req) {
   });
 }
 
+async function sendTabCommand(targetId, req) {
+  const envTimeout = Number(process.env.CDP_TIMEOUT_MS);
+  const wire = { ...req, build: BUILD, timeoutMs: envTimeout > 0 ? envTimeout : undefined };
+  let response = await sendCommand(await getOrStartTabDaemon(targetId), wire);
+  if (!response.ok && response.stale) {
+    response = await sendCommand(await getOrStartTabDaemon(targetId), wire);
+  }
+  return response;
+}
+
 // Stop daemons
 
 async function stopDaemons(targetPrefix) {
@@ -702,11 +735,10 @@ Usage: cdp <command> [args]
   type    <target> <text>           Input.insertText at focus (works in cross-origin iframes)
   loadall <target> <selector> [ms]  Repeat-click until selector disappears (default 1500ms, 5min cap)
   evalraw <target> <method> [json]  Raw CDP method passthrough; returns JSON
-  open  [url] [--window|-w]         New tab (default about:blank). --window/-w opens a new browser
-        [--in <target>]             window so tab activation doesn't steal focus; --in puts the tab in
-                                    the same window as <target>, prints the bare new targetId on stdout
-                                    and re-activates the opener. New targets trigger a fresh
-                                    "Allow debugging?" prompt on first access.
+  open  [url] [--window|-w]         New inactive tab (default about:blank). --window/-w bootstraps a
+        [--in <target>]             browser window and may raise it; --in opens inactive in <target>'s
+                                    window by trusted middle-click, without raising the window or
+                                    changing its active tab. Prints bare new targetId on stdout.
   stop  [target]                    Stop daemon(s)
 
 <target> is a unique targetId prefix from "cdp list". Use more chars to disambiguate.
@@ -776,35 +808,35 @@ async function main() {
     return;
   }
 
-  // --window/-w opens a separate browser window so tab activation doesn't steal focus
   if (cmd === 'open') {
     const newWindow = args.includes('--window') || args.includes('-w');
     const inIdx = args.indexOf('--in');
     const inTarget = inIdx >= 0 ? args[inIdx + 1] : null;
     const url = args.find((a, i) => !a.startsWith('-') && i !== inIdx + 1) || 'about:blank';
 
-    // Target.createTarget has no windowId parameter; window.open from a tab already
-    // in that window is the only way to place a tab in a specific window
+    // Target.createTarget has no windowId parameter. A trusted middle-click on a
+    // temporary link opens a background tab in the host tab's window without raising
+    // that window or changing its active tab
     if (inTarget) {
       const hostId = await resolveTargetId(inTarget);
       const before = new Set((await withBrowser(refreshPages)).map(p => p.targetId));
-      const conn = await getOrStartTabDaemon(hostId);
-      const res = await sendCommand(conn, { cmd: 'evalraw', args: ['Runtime.evaluate',
-        JSON.stringify({ expression: `window.open(${JSON.stringify(url)}, '_blank')`, userGesture: true })] });
+      const res = await sendTabCommand(hostId, { cmd: 'openbg', args: [url] });
       if (!res.ok) { console.error('Error:', res.error); process.exit(1); }
       await sleep(500);
-      const opened = (await withBrowser(refreshPages)).find(p => !before.has(p.targetId));
-      // window.open activates the new tab; hand activation back to the opener so the
-      // disruption stays inside the agent window
-      await withBrowser(cdp => cdp.send('Target.activateTarget', { targetId: hostId }));
-      process.stderr.write(`opened in window of ${hostId.slice(0, 8)}, opener re-activated: ${url}\n`);
+      const pages = await withBrowser(async (cdp) => annotateWindows(cdp, await refreshPages(cdp)));
+      const { windowId: hostWindow } = await withBrowser(cdp => cdp.send('Browser.getWindowForTarget', { targetId: hostId }));
+      const opened = pages.find(p => !before.has(p.targetId) && p.windowId === hostWindow);
+      process.stderr.write(`opened inactive in window of ${hostId.slice(0, 8)}: ${url}\n`);
       console.log(opened ? opened.targetId.slice(0, 8) : '');
-      if (!opened) { console.error('New target not found; run "cdp list"'); process.exit(1); }
+      if (!opened) { console.error('Background tab not found; run "cdp list"'); process.exit(1); }
       return;
     }
 
     await withBrowser(async (cdp) => {
-      const { targetId } = await cdp.send('Target.createTarget', newWindow ? { url, newWindow: true } : { url });
+      const params = newWindow
+        ? { url, newWindow: true, focus: false }
+        : { url, background: true, focus: false };
+      const { targetId } = await cdp.send('Target.createTarget', params);
       // New tab may not appear in getTargets immediately; insert manually
       const pages = await getPages(cdp);
       if (!pages.some(p => p.targetId === targetId)) pages.push({ targetId, title: url, url });
@@ -830,9 +862,6 @@ async function main() {
   }
 
   const targetId = await resolveTargetId(targetPrefix);
-
-  const conn = await getOrStartTabDaemon(targetId);
-
   const cmdArgs = args.slice(1);
 
   if (cmd === 'eval' || cmd === 'type') {
@@ -841,6 +870,10 @@ async function main() {
     cmdArgs[0] = joined;
   } else if (cmd === 'evalraw') {
     if (!cmdArgs[0]) { console.error('Error: CDP method required'); process.exit(1); }
+    if (['Target.activateTarget', 'Page.bringToFront'].includes(cmdArgs[0]) && process.env.CDP_ALLOW_FOCUS !== '1') {
+      console.error(`Error: ${cmdArgs[0]} raises the browser; use cdp wake, or set CDP_ALLOW_FOCUS=1 when foreground is unavoidable`);
+      process.exit(1);
+    }
     if (cmdArgs.length > 2) cmdArgs[1] = cmdArgs.slice(1).join(' ');
   }
 
@@ -856,12 +889,7 @@ async function main() {
     process.exit(1);
   }
 
-  const envTimeout = Number(process.env.CDP_TIMEOUT_MS);
-  const req = { cmd, args: cmdArgs, build: BUILD, timeoutMs: envTimeout > 0 ? envTimeout : undefined };
-  let response = await sendCommand(conn, req);
-  if (!response.ok && response.stale) {
-    response = await sendCommand(await getOrStartTabDaemon(targetId), req);
-  }
+  const response = await sendTabCommand(targetId, { cmd, args: cmdArgs });
 
   if (response.ok) {
     if (response.result) console.log(response.result);
