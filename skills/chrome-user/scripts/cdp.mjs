@@ -736,9 +736,9 @@ Usage: cdp <command> [args]
   loadall <target> <selector> [ms]  Repeat-click until selector disappears (default 1500ms, 5min cap)
   evalraw <target> <method> [json]  Raw CDP method passthrough; returns JSON
   open  [url] [--window|-w]         New inactive tab (default about:blank). --window/-w bootstraps a
-        [--in <target>]             browser window and may raise it; --in opens inactive in <target>'s
-                                    window by trusted middle-click, without raising the window or
-                                    changing its active tab. Prints bare new targetId on stdout.
+        [--in <target>]             browser window only when fewer than two exist; --in opens inactive
+                                    in <target>'s window without raising it or changing its active tab.
+                                    Prints bare new targetId on stdout.
   stop  [target]                    Stop daemon(s)
 
 <target> is a unique targetId prefix from "cdp list". Use more chars to disambiguate.
@@ -832,6 +832,20 @@ async function main() {
       return;
     }
 
+    if (newWindow && process.env.CDP_ALLOW_NEW_WINDOW !== '1') {
+      const pages = await withBrowser(async (cdp) => annotateWindows(cdp, await refreshPages(cdp)));
+      const groups = new Map();
+      for (const p of pages) {
+        if (!p.windowId) continue;
+        if (!groups.has(p.windowId)) groups.set(p.windowId, []);
+        groups.get(p.windowId).push(p);
+      }
+      if (groups.size >= 2) {
+        const tabs = [...groups.values()].sort((a, b) => a.length - b.length)[0];
+        throw new Error(`${groups.size} browser windows already exist; reuse the smallest: cdp open <url> --in ${tabs[0].targetId.slice(0, 8)}. Set CDP_ALLOW_NEW_WINDOW=1 only when a new window was explicitly requested`);
+      }
+    }
+
     await withBrowser(async (cdp) => {
       const params = newWindow
         ? { url, newWindow: true, focus: false }
@@ -875,6 +889,16 @@ async function main() {
       process.exit(1);
     }
     if (cmdArgs.length > 2) cmdArgs[1] = cmdArgs.slice(1).join(' ');
+    if (cmdArgs[0] === 'Target.createTarget' && process.env.CDP_ALLOW_NEW_WINDOW !== '1') {
+      try {
+        if (JSON.parse(cmdArgs[1] || '{}').newWindow) {
+          console.error('Error: direct new-window creation is blocked; use cdp open --window, which first checks whether a reusable window exists');
+          process.exit(1);
+        }
+      } catch (e) {
+        if (!(e instanceof SyntaxError)) throw e;
+      }
+    }
   }
 
   if (cmd === 'shot') {

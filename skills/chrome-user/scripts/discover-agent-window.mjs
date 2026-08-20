@@ -71,14 +71,6 @@ try {
 
   const sorted = [...groups.entries()].sort((a, b) => a[1].length - b[1].length);
   const [agentWid, agentTabs] = sorted[0];
-  const mainTabs = sorted.at(-1)[1];
-
-  // require gap so two user windows don't get pinned as agent
-  if (mainTabs.length - agentTabs.length < 5 && agentTabs.length > 5) {
-    process.stderr.write(`ambiguous: smallest window has ${agentTabs.length} tabs, largest has ${mainTabs.length}. Not pinning.\n`);
-    process.exit(1);
-  }
-
   const blank = agentTabs.find((t) => t.url && SEED_RE.test(t.url));
   const seed = blank || agentTabs[0];
   if (!blank) process.stderr.write(`seed tab is a real page (${seed.url}) — do not navigate it, use: cdp open <url> --in ${seed.targetId.slice(0, 8)}\n`);
