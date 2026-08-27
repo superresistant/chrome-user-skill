@@ -40,6 +40,10 @@ function sockPath(targetId) {
   return resolve(RUNTIME_DIR, `cdp-${targetId}.sock`);
 }
 
+function leasePath(targetId) {
+  return resolve(RUNTIME_DIR, `lease-${targetId}`);
+}
+
 function getWsUrl() {
   const browsers = ['google-chrome', 'google-chrome-beta', 'chromium', 'vivaldi', 'vivaldi-snapshot', 'BraveSoftware/Brave-Browser', 'microsoft-edge'];
   const base = resolve(homedir(), '.config');
@@ -93,8 +97,9 @@ class CDP {
       this.#ws.onmessage = (ev) => {
         const msg = JSON.parse(ev.data);
         if (msg.id && this.#pending.has(msg.id)) {
-          const { resolve, reject } = this.#pending.get(msg.id);
+          const { resolve, reject, timer } = this.#pending.get(msg.id);
           this.#pending.delete(msg.id);
+          clearTimeout(timer);
           if (msg.error) reject(new Error(msg.error.message));
           else resolve(msg.result);
         } else if (msg.method && this.#eventHandlers.has(msg.method)) {
@@ -109,16 +114,16 @@ class CDP {
   send(method, params = {}, sessionId) {
     const id = ++this.#id;
     return new Promise((resolve, reject) => {
-      this.#pending.set(id, { resolve, reject });
-      const msg = { id, method, params };
-      if (sessionId) msg.sessionId = sessionId;
-      this.#ws.send(JSON.stringify(msg));
-      setTimeout(() => {
+      const timer = setTimeout(() => {
         if (this.#pending.has(id)) {
           this.#pending.delete(id);
           reject(new Error(`Timeout: ${method}`));
         }
       }, this.timeoutMs);
+      this.#pending.set(id, { resolve, reject, timer });
+      const msg = { id, method, params };
+      if (sessionId) msg.sessionId = sessionId;
+      this.#ws.send(JSON.stringify(msg));
     });
   }
 
@@ -277,28 +282,6 @@ async function evalStr(cdp, sid, expression) {
   return typeof val === 'object' ? JSON.stringify(val, null, 2) : String(val ?? '');
 }
 
-async function openBackgroundStr(cdp, sid, url) {
-  const marker = `__cdp_bgopen_${Date.now()}`;
-  await evalStr(cdp, sid, `(()=>{
-    const a=document.createElement('a');
-    a.id=${JSON.stringify(marker)};
-    a.href=${JSON.stringify(url)};
-    a.target='_blank';
-    a.rel='noopener';
-    Object.assign(a.style,{position:'fixed',left:'0',top:'0',width:'20px',height:'20px',zIndex:'2147483647',display:'block',pointerEvents:'auto'});
-    document.documentElement.append(a);
-    return true;
-  })()`);
-  try {
-    const base = { x: 10, y: 10, button: 'middle', clickCount: 1, modifiers: 0 };
-    await cdp.send('Input.dispatchMouseEvent', { ...base, type: 'mousePressed' }, sid);
-    await cdp.send('Input.dispatchMouseEvent', { ...base, type: 'mouseReleased' }, sid);
-  } finally {
-    try { await evalStr(cdp, sid, `document.getElementById(${JSON.stringify(marker)})?.remove()`); } catch {}
-  }
-  return 'Background tab requested by trusted middle-click';
-}
-
 async function wakeStr(cdp, sid, off = false) {
   if (off) {
     try { await cdp.send('Page.stopScreencast', {}, sid); } catch {}
@@ -356,8 +339,8 @@ async function htmlStr(cdp, sid, selector) {
 async function navStr(cdp, sid, url) {
   try {
     const parsed = new URL(url);
-    if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:')
-      throw new Error(`Only http/https URLs allowed, got: ${url}`);
+    if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:' && url !== 'about:blank' && !url.startsWith('about:blank#'))
+      throw new Error(`Only http/https URLs and about:blank are allowed, got: ${url}`);
   } catch (e) {
     if (e.message.startsWith('Only')) throw e;
     throw new Error(`Invalid URL: ${url}`);
@@ -548,7 +531,6 @@ async function runDaemon(targetId) {
         }
         case 'snap': result = await snapshotStr(cdp, sessionId, true); break;
         case 'eval': result = await evalStr(cdp, sessionId, args[0]); break;
-        case 'openbg': result = await openBackgroundStr(cdp, sessionId, args[0]); break;
         case 'shot': result = await shotStr(cdp, sessionId, args[0], targetId, args[1] === '--fresh'); break;
         case 'wake': result = await wakeStr(cdp, sessionId, args[0] === '--off'); break;
         case 'html': result = await htmlStr(cdp, sessionId, args[0]); break;
@@ -718,7 +700,7 @@ Usage: cdp <command> [args]
   list  [--window <id>|--windows]   List open pages with unique targetId prefixes; filter by windowId
                                     or add a win= column grouped by window
   window <target>                   windowId + bounds of the window holding this tab
-  close  <target>                   Close tab
+  close  <target>                   Release leased pool tab, otherwise close tab
   wake   <target> [--off]           Focus emulation + active lifecycle + tiny screencast: background
                                     tab reports hasFocus()/visible, takes key events, keeps timers and
                                     rAF running; --off reverts
@@ -735,10 +717,9 @@ Usage: cdp <command> [args]
   type    <target> <text>           Input.insertText at focus (works in cross-origin iframes)
   loadall <target> <selector> [ms]  Repeat-click until selector disappears (default 1500ms, 5min cap)
   evalraw <target> <method> [json]  Raw CDP method passthrough; returns JSON
-  open  [url] [--window|-w]         New inactive tab (default about:blank). --window/-w bootstraps a
-        [--in <target>]             browser window only when fewer than two exist; --in opens inactive
-                                    in <target>'s window without raising it or changing its active tab.
-                                    Prints bare new targetId on stdout.
+  open  <url> --in <target>         Lease an inactive pool tab in <target>'s window without raising it
+                                    or changing its active tab. Prints the targetId on stdout. Direct tab
+                                    or window creation requires CDP_ALLOW_FOCUS=1 because Vivaldi raises.
   stop  [target]                    Stop daemon(s)
 
 <target> is a unique targetId prefix from "cdp list". Use more chars to disambiguate.
@@ -792,6 +773,18 @@ async function main() {
 
   if (cmd === 'close') {
     const targetId = await resolveTargetId(args[0]);
+    const lease = leasePath(targetId);
+    if (existsSync(lease)) {
+      try {
+        const res = await sendTabCommand(targetId, { cmd: 'nav', args: ['about:blank#pi-agent-pool'] });
+        if (!res.ok) throw new Error(res.error);
+        await withBrowser(refreshPages);
+      } finally {
+        try { unlinkSync(lease); } catch {}
+      }
+      console.log(`Released ${targetId.slice(0, 8)}`);
+      return;
+    }
     await withBrowser(async (cdp) => {
       await cdp.send('Target.closeTarget', { targetId });
       await sleep(300);
@@ -814,22 +807,39 @@ async function main() {
     const inTarget = inIdx >= 0 ? args[inIdx + 1] : null;
     const url = args.find((a, i) => !a.startsWith('-') && i !== inIdx + 1) || 'about:blank';
 
-    // Target.createTarget has no windowId parameter. A trusted middle-click on a
-    // temporary link opens a background tab in the host tab's window without raising
-    // that window or changing its active tab
     if (inTarget) {
       const hostId = await resolveTargetId(inTarget);
-      const before = new Set((await withBrowser(refreshPages)).map(p => p.targetId));
-      const res = await sendTabCommand(hostId, { cmd: 'openbg', args: [url] });
-      if (!res.ok) { console.error('Error:', res.error); process.exit(1); }
-      await sleep(500);
       const pages = await withBrowser(async (cdp) => annotateWindows(cdp, await refreshPages(cdp)));
-      const { windowId: hostWindow } = await withBrowser(cdp => cdp.send('Browser.getWindowForTarget', { targetId: hostId }));
-      const opened = pages.find(p => !before.has(p.targetId) && p.windowId === hostWindow);
-      process.stderr.write(`opened inactive in window of ${hostId.slice(0, 8)}: ${url}\n`);
-      console.log(opened ? opened.targetId.slice(0, 8) : '');
-      if (!opened) { console.error('Background tab not found; run "cdp list"'); process.exit(1); }
+      const host = pages.find(p => p.targetId === hostId);
+      const reusable = pages
+        .filter(p => p.windowId === host?.windowId && (p.url === 'about:blank' || p.url.startsWith('about:blank#pi-agent-pool')))
+        .sort((a, b) => Number(b.targetId === hostId) - Number(a.targetId === hostId));
+      let leased;
+      for (const page of reusable) {
+        try {
+          writeFileSync(leasePath(page.targetId), url, { flag: 'wx', mode: 0o600 });
+          leased = page;
+          break;
+        } catch (e) {
+          if (e.code !== 'EEXIST') throw e;
+        }
+      }
+      if (!leased) throw new Error('No reusable agent tab is available; provision an about:blank#pi-agent-pool tab while Vivaldi is already focused');
+      try {
+        const res = await sendTabCommand(leased.targetId, { cmd: 'evalraw', args: ['Page.navigate', JSON.stringify({ url })] });
+        if (!res.ok) throw new Error(res.error);
+        await withBrowser(refreshPages);
+      } catch (e) {
+        try { unlinkSync(leasePath(leased.targetId)); } catch {}
+        throw e;
+      }
+      process.stderr.write(`leased inactive tab in window of ${hostId.slice(0, 8)}: ${url}\n`);
+      console.log(leased.targetId.slice(0, 8));
       return;
+    }
+
+    if (process.env.CDP_ALLOW_FOCUS !== '1') {
+      throw new Error('Direct tab/window creation can raise Vivaldi; use --in with the agent tab pool, or explicitly set CDP_ALLOW_FOCUS=1');
     }
 
     if (newWindow && process.env.CDP_ALLOW_NEW_WINDOW !== '1') {
@@ -881,6 +891,10 @@ async function main() {
   if (cmd === 'eval' || cmd === 'type') {
     const joined = cmdArgs.join(' ');
     if (!joined) { console.error(`Error: ${cmd === 'eval' ? 'expression' : 'text'} required`); process.exit(1); }
+    if (cmd === 'eval' && /\b(?:window|globalThis)\.focus\s*\(/.test(joined) && process.env.CDP_ALLOW_FOCUS !== '1') {
+      console.error('Error: window.focus() raises the browser; set CDP_ALLOW_FOCUS=1 only when foreground is unavoidable');
+      process.exit(1);
+    }
     cmdArgs[0] = joined;
   } else if (cmd === 'evalraw') {
     if (!cmdArgs[0]) { console.error('Error: CDP method required'); process.exit(1); }
@@ -889,10 +903,14 @@ async function main() {
       process.exit(1);
     }
     if (cmdArgs.length > 2) cmdArgs[1] = cmdArgs.slice(1).join(' ');
+    if (cmdArgs[0] === 'Target.createTarget' && process.env.CDP_ALLOW_FOCUS !== '1') {
+      console.error('Error: Target.createTarget raises Vivaldi even with background:true; use cdp open --in, or set CDP_ALLOW_FOCUS=1');
+      process.exit(1);
+    }
     if (cmdArgs[0] === 'Target.createTarget' && process.env.CDP_ALLOW_NEW_WINDOW !== '1') {
       try {
         if (JSON.parse(cmdArgs[1] || '{}').newWindow) {
-          console.error('Error: direct new-window creation is blocked; use cdp open --window, which first checks whether a reusable window exists');
+          console.error('Error: direct new-window creation is blocked; set CDP_ALLOW_NEW_WINDOW=1 only when a new window was explicitly requested');
           process.exit(1);
         }
       } catch (e) {
