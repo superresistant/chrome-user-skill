@@ -62,7 +62,7 @@ Console history not retroactive. `console.error` calls before eval ran are unrea
 if(!window.__errs){window.__errs=0;const o=console.error;console.error=function(){window.__errs++;return o.apply(this,arguments)}}
 ```
 
-Keyboard events. `cdp evalraw $T Input.dispatchKeyEvent` is `isTrusted=true`. `dispatchEvent(new KeyboardEvent(...))` is untrusted, rejected by modern apps. Event: `{"type":"keyDown","key":"A","code":"KeyA","windowsVirtualKeyCode":65,"modifiers":N}`. Always send matching `keyUp`. Modifiers sum: Alt=1, Ctrl=2, Meta=4, Shift=8. Common vk: Backspace=8, Enter=13, Escape=27
+Keyboard events. Chromium ignores `cdp type`/`Input.insertText` in an inactive browser tab even with focus emulation; use the element's native value setter plus `input`/`change` events. Trusted foreground typing is incompatible with the no-focus policy. `cdp evalraw $T Input.dispatchKeyEvent` is `isTrusted=true`. `dispatchEvent(new KeyboardEvent(...))` is untrusted, rejected by modern apps. Event: `{"type":"keyDown","key":"A","code":"KeyA","windowsVirtualKeyCode":65,"modifiers":N}`. Always send matching `keyUp`. Modifiers sum: Alt=1, Ctrl=2, Meta=4, Shift=8. Common vk: Backspace=8, Enter=13, Escape=27
 
 Cross-origin iframes. `cdp eval`/`cdp snap`/`cdp html` stop at cross-origin iframe boundary. Reach inside via direct CDP (not CLI):
 

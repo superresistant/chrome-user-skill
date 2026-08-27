@@ -714,7 +714,7 @@ Usage: cdp <command> [args]
   net   <target>                    performance.getEntriesByType('resource') dump
   click   <target> <selector>       Trusted click via Input.dispatchMouseEvent
   clickxy <target> <x> <y>          Trusted click at CSS pixel coords
-  type    <target> <text>           Input.insertText at focus (works in cross-origin iframes)
+  type    <target> <text>           Input.insertText at focus; inactive browser tabs may ignore it
   loadall <target> <selector> [ms]  Repeat-click until selector disappears (default 1500ms, 5min cap)
   evalraw <target> <method> [json]  Raw CDP method passthrough; returns JSON
   open  <url> --in <target>         Lease an inactive pool tab in <target>'s window without raising it
