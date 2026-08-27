@@ -29,6 +29,7 @@ const BUILD = (() => {
 const DAEMON_CONNECT_RETRIES = 20;
 const DAEMON_CONNECT_DELAY = 300;
 const MIN_TARGET_PREFIX_LEN = 8;
+const WINDOW_CONTROL_JS = /(?:(?:\b(?:window|globalThis|self|top|parent)\s*(?:\.\s*(?:focus|open|close)|\[\s*['"](?:focus|open|close)['"]\s*\]))|(?<![\w.])(?:focus|open|close))\s*\(/;
 process.umask(0o077);
 const RUNTIME_DIR = process.env.XDG_RUNTIME_DIR
   ? resolve(process.env.XDG_RUNTIME_DIR, 'cdp')
@@ -810,14 +811,17 @@ async function main() {
     const targetId = await resolveTargetId(args[0]);
     const lease = leasePath(targetId);
     if (existsSync(lease)) {
-      try {
-        const res = await sendTabCommand(targetId, { cmd: 'nav', args: ['about:blank#pi-agent-pool'] });
-        if (!res.ok) throw new Error(res.error);
-        await withBrowser(refreshPages);
-      } finally {
-        try { unlinkSync(lease); } catch {}
-      }
+      const res = await sendTabCommand(targetId, { cmd: 'nav', args: ['about:blank#pi-agent-pool'] });
+      if (!res.ok) throw new Error(res.error);
+      await withBrowser(refreshPages);
+      try { unlinkSync(lease); } catch {}
       console.log(`Released ${targetId.slice(0, 8)}`);
+      return;
+    }
+    const pages = await withBrowser(refreshPages);
+    const page = pages.find(p => p.targetId === targetId);
+    if (page?.url.startsWith('about:blank#pi-agent-pool')) {
+      console.log(`Pool tab ${targetId.slice(0, 8)} is already available`);
       return;
     }
     await withBrowser(async (cdp) => {
@@ -926,8 +930,8 @@ async function main() {
   if (cmd === 'eval' || cmd === 'type') {
     const joined = cmdArgs.join(' ');
     if (!joined) { console.error(`Error: ${cmd === 'eval' ? 'expression' : 'text'} required`); process.exit(1); }
-    if (cmd === 'eval' && /\b(?:window|globalThis)\.focus\s*\(/.test(joined) && process.env.CDP_ALLOW_FOCUS !== '1') {
-      console.error('Error: window.focus() raises the browser; set CDP_ALLOW_FOCUS=1 only when foreground is unavoidable');
+    if (cmd === 'eval' && WINDOW_CONTROL_JS.test(joined) && process.env.CDP_ALLOW_FOCUS !== '1') {
+      console.error('Error: window.focus()/open()/close() bypasses browser policy; use the leased tab, or set CDP_ALLOW_FOCUS=1 only when foreground is unavoidable');
       process.exit(1);
     }
     cmdArgs[0] = joined;
@@ -938,6 +942,20 @@ async function main() {
       process.exit(1);
     }
     if (cmdArgs.length > 2) cmdArgs[1] = cmdArgs.slice(1).join(' ');
+    if (['Target.closeTarget', 'Page.close', 'Browser.close'].includes(cmdArgs[0])) {
+      console.error(`Error: ${cmdArgs[0]} bypasses pool cleanup; use cdp close <target>`);
+      process.exit(1);
+    }
+    if (cmdArgs[0] === 'Runtime.evaluate' && process.env.CDP_ALLOW_FOCUS !== '1') {
+      try {
+        if (WINDOW_CONTROL_JS.test(JSON.parse(cmdArgs[1] || '{}').expression || '')) {
+          console.error('Error: Runtime.evaluate window control bypasses browser policy; use the leased tab');
+          process.exit(1);
+        }
+      } catch (e) {
+        if (!(e instanceof SyntaxError)) throw e;
+      }
+    }
     if (cmdArgs[0] === 'Target.createTarget' && process.env.CDP_ALLOW_FOCUS !== '1') {
       console.error('Error: Target.createTarget raises Vivaldi even with background:true; use cdp open --in, or set CDP_ALLOW_FOCUS=1');
       process.exit(1);
@@ -959,6 +977,15 @@ async function main() {
     const file = cmdArgs.find(a => a !== '--fresh');
     cmdArgs.length = 0;
     cmdArgs.push(file, fresh ? '--fresh' : '');
+  }
+
+  const mutatesPool = ['nav', 'eval', 'evalraw', 'click', 'clickxy', 'type', 'loadall'].includes(cmd);
+  if (mutatesPool && !existsSync(leasePath(targetId))) {
+    const page = (await withBrowser(refreshPages)).find(p => p.targetId === targetId);
+    if (page?.url.startsWith('about:blank#pi-agent-pool')) {
+      console.error('Error: lease this pool tab with cdp open <url> --in <target>; free pool tabs are immutable');
+      process.exit(1);
+    }
   }
 
   if (cmd === 'nav' && !cmdArgs[0]) {
