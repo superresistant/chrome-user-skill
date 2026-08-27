@@ -847,7 +847,7 @@ async function main() {
       const pages = await withBrowser(async (cdp) => annotateWindows(cdp, await refreshPages(cdp)));
       const host = pages.find(p => p.targetId === hostId);
       const reusable = pages
-        .filter(p => p.windowId === host?.windowId && (p.url === 'about:blank' || p.url.startsWith('about:blank#pi-agent-pool')))
+        .filter(p => p.windowId === host?.windowId && p.url.startsWith('about:blank#pi-agent-pool'))
         .sort((a, b) => Number(b.targetId === hostId) - Number(a.targetId === hostId));
       let leased;
       for (const page of reusable) {

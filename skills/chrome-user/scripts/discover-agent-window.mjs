@@ -1,9 +1,9 @@
 #!/usr/bin/env node
 // Discover user's agent window. Prints AGENT_WINDOW_ID, AGENT_SEED_TAB,
 // AGENT_SEED_BLANK, AGENT_WINDOW_TAB_COUNT as shell-evalable assignments. Exit 1
-// if only one window. Heuristic: window with fewest page tabs; seed prefers
-// about:blank|example.com|localhost|127.0.0.1. AGENT_SEED_BLANK=0 means the seed
-// is a real user page — open a tab instead of navigating it.
+// if only one window. A unique window containing agent-pool tabs wins; otherwise
+// fall back to the window with fewest page tabs. AGENT_SEED_BLANK=0 means the seed
+// is a real user page — lease a pool tab instead of navigating it.
 
 import { readFileSync } from 'fs';
 import { homedir } from 'os';
@@ -17,7 +17,8 @@ const PORT_FILES = [
   `${homedir()}/.config/microsoft-edge/DevToolsActivePort`,
 ].filter(Boolean);
 
-const SEED_RE = /^(about:blank$|https?:\/\/(www\.)?example\.com\/?$|https?:\/\/(localhost|127\.0\.0\.1)(:\d+)?(\/|$))/;
+const POOL_RE = /^about:blank#pi-agent-pool/;
+const SEED_RE = /^(about:blank($|#pi-agent-pool)|https?:\/\/(www\.)?example\.com\/?$|https?:\/\/(localhost|127\.0\.0\.1)(:\d+)?(\/|$))/;
 
 try {
   let port, path = '';
@@ -69,9 +70,15 @@ try {
     process.exit(1);
   }
 
+  const poolGroups = [...groups.entries()].filter(([, tabs]) => tabs.some(t => POOL_RE.test(t.url || '')));
+  if (poolGroups.length > 1) {
+    process.stderr.write(`agent pool is split across ${poolGroups.length} windows; recover it before browsing\n`);
+    process.exit(1);
+  }
   const sorted = [...groups.entries()].sort((a, b) => a[1].length - b[1].length);
-  const [agentWid, agentTabs] = sorted[0];
-  const blank = agentTabs.find((t) => t.url && SEED_RE.test(t.url));
+  const [agentWid, agentTabs] = poolGroups[0] || sorted[0];
+  if (!poolGroups.length) process.stderr.write('no agent-pool tabs found; browser work will fail safely until the pool is provisioned\n');
+  const blank = agentTabs.find((t) => POOL_RE.test(t.url || '')) || agentTabs.find((t) => t.url && SEED_RE.test(t.url));
   const seed = blank || agentTabs[0];
   if (!blank) process.stderr.write(`seed tab is a real page (${seed.url}) — do not navigate it, use: cdp open <url> --in ${seed.targetId.slice(0, 8)}\n`);
   process.stdout.write(`AGENT_WINDOW_ID=${agentWid}\nAGENT_SEED_TAB=${seed.targetId.slice(0, 8)}\nAGENT_SEED_BLANK=${blank ? 1 : 0}\nAGENT_WINDOW_TAB_COUNT=${agentTabs.length}\n`);
