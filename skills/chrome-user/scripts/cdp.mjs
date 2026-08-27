@@ -4,7 +4,7 @@
 // once per daemon. Daemon self-cleans on tab close and browser exit;
 // IDLE_TIMEOUT is the backstop. CDP_IDLE_MS overrides (ms); =0 disables.
 
-import { readFileSync, writeFileSync, unlinkSync, existsSync, mkdirSync, statSync } from 'fs';
+import { readFileSync, writeFileSync, unlinkSync, existsSync, mkdirSync, statSync, readdirSync } from 'fs';
 import { homedir } from 'os';
 import { resolve } from 'path';
 import { spawn } from 'child_process';
@@ -701,6 +701,7 @@ Usage: cdp <command> [args]
                                     or add a win= column grouped by window
   window <target>                   windowId + bounds of the window holding this tab
   close  <target>                   Release leased pool tab, otherwise close tab
+  pool-reset                       Recover every leased pool tab and remove stale leases
   wake   <target> [--off]           Focus emulation + active lifecycle + tiny screencast: background
                                     tab reports hasFocus()/visible, takes key events, keeps timers and
                                     rAF running; --off reverts
@@ -768,6 +769,40 @@ async function main() {
       console.log(formatPageList(pages));
     });
     setTimeout(() => process.exit(0), 100);
+    return;
+  }
+
+  if (cmd === 'pool-reset') {
+    const leaseFiles = readdirSync(RUNTIME_DIR).filter(name => name.startsWith('lease-'));
+    let reset = 0;
+    let stale = 0;
+    await withBrowser(async (cdp) => {
+      const pages = await getPages(cdp);
+      const pageIds = new Set(pages.map(page => page.targetId));
+      for (const name of leaseFiles) {
+        const targetId = name.slice('lease-'.length);
+        const lease = resolve(RUNTIME_DIR, name);
+        if (!pageIds.has(targetId)) {
+          try { unlinkSync(lease); } catch {}
+          stale++;
+          continue;
+        }
+        let sessionId;
+        try {
+          ({ sessionId } = await cdp.send('Target.attachToTarget', { targetId, flatten: true }));
+          await cdp.send('Page.navigate', { url: 'about:blank#pi-agent-pool' }, sessionId);
+          try { unlinkSync(lease); } catch {}
+          reset++;
+        } finally {
+          if (sessionId) {
+            try { await cdp.send('Target.detachFromTarget', { sessionId }); } catch {}
+          }
+        }
+      }
+      if (reset) await sleep(100);
+      await refreshPages(cdp);
+    });
+    console.log(`Reset ${reset} leased tab(s); removed ${stale} stale lease(s)`);
     return;
   }
 
