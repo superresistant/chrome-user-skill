@@ -18,7 +18,7 @@ const PORT_FILES = [
 ].filter(Boolean);
 
 const POOL_RE = /^about:blank#pi-agent-pool/;
-const SEED_RE = /^(about:blank($|#pi-agent-pool)|https?:\/\/(www\.)?example\.com\/?$|https?:\/\/(localhost|127\.0\.0\.1)(:\d+)?(\/|$))/;
+const SEED_RE = /^(about:blank($|#pi-agent-pool)|chrome:\/(?:\/vivaldi-webui\/startpage|\/newtab)(?:[/?#]|$)|https?:\/\/(www\.)?example\.com\/?$|https?:\/\/(localhost|127\.0\.0\.1)(:\d+)?(\/|$))/;
 
 try {
   let port, path = '';
@@ -77,7 +77,7 @@ try {
   }
   const sorted = [...groups.entries()].sort((a, b) => a[1].length - b[1].length);
   const [agentWid, agentTabs] = poolGroups[0] || sorted[0];
-  if (!poolGroups.length) process.stderr.write('no agent-pool tabs found; browser work will fail safely until the pool is provisioned\n');
+  if (!poolGroups.length) process.stderr.write('no agent-pool tabs found; safe Vivaldi Start Page tabs will be initialized on first lease\n');
   const blank = agentTabs.find((t) => POOL_RE.test(t.url || '')) || agentTabs.find((t) => t.url && SEED_RE.test(t.url));
   const seed = blank || agentTabs[0];
   if (!blank) process.stderr.write(`seed tab is a real page (${seed.url}) — do not navigate it, use: cdp open <url> --in ${seed.targetId.slice(0, 8)}\n`);

@@ -45,6 +45,11 @@ function leasePath(targetId) {
   return resolve(RUNTIME_DIR, `lease-${targetId}`);
 }
 
+const isPoolUrl = url => url?.startsWith('about:blank#pi-agent-pool');
+const isPoolCandidateUrl = url => isPoolUrl(url)
+  || url === 'about:blank'
+  || /^chrome:\/\/(?:vivaldi-webui\/startpage|newtab)(?:[/?#]|$)/.test(url || '');
+
 function getWsUrl() {
   const browsers = ['google-chrome', 'google-chrome-beta', 'chromium', 'vivaldi', 'vivaldi-snapshot', 'BraveSoftware/Brave-Browser', 'microsoft-edge'];
   const base = resolve(homedir(), '.config');
@@ -176,7 +181,28 @@ class CDP {
 
 async function getPages(cdp) {
   const { targetInfos } = await cdp.send('Target.getTargets');
-  return targetInfos.filter(t => t.type === 'page' && !t.url.startsWith('chrome://'));
+  return targetInfos.filter(t => t.type === 'page' && (!t.url.startsWith('chrome://') || isPoolCandidateUrl(t.url)));
+}
+
+async function initializePool(cdp, pages, windowId, limit = 5) {
+  const existing = pages.filter(p => p.windowId === windowId && isPoolUrl(p.url)).length;
+  const candidates = pages
+    .filter(p => p.windowId === windowId && !isPoolUrl(p.url) && isPoolCandidateUrl(p.url))
+    .slice(0, Math.max(0, limit - existing));
+  let initialized = 0;
+  for (const page of candidates) {
+    let sessionId;
+    try {
+      ({ sessionId } = await cdp.send('Target.attachToTarget', { targetId: page.targetId, flatten: true }));
+      await cdp.send('Page.navigate', { url: 'about:blank#pi-agent-pool' }, sessionId);
+      initialized++;
+    } finally {
+      if (sessionId) {
+        try { await cdp.send('Target.detachFromTarget', { sessionId }); } catch {}
+      }
+    }
+  }
+  return initialized;
 }
 
 async function withBrowser(fn) {
@@ -820,7 +846,7 @@ async function main() {
     }
     const pages = await withBrowser(refreshPages);
     const page = pages.find(p => p.targetId === targetId);
-    if (page?.url.startsWith('about:blank#pi-agent-pool')) {
+    if (isPoolUrl(page?.url)) {
       console.log(`Pool tab ${targetId.slice(0, 8)} is already available`);
       return;
     }
@@ -848,11 +874,18 @@ async function main() {
 
     if (inTarget) {
       const hostId = await resolveTargetId(inTarget);
-      const pages = await withBrowser(async (cdp) => annotateWindows(cdp, await refreshPages(cdp)));
-      const host = pages.find(p => p.targetId === hostId);
+      let pages = await withBrowser(async (cdp) => annotateWindows(cdp, await refreshPages(cdp)));
+      let host = pages.find(p => p.targetId === hostId);
+      if (!host) throw new Error(`Host tab ${inTarget} disappeared`);
+      const initialized = await withBrowser(cdp => initializePool(cdp, pages, host.windowId));
+      if (initialized) {
+        await sleep(100);
+        pages = await withBrowser(async (cdp) => annotateWindows(cdp, await refreshPages(cdp)));
+        host = pages.find(p => p.targetId === hostId);
+      }
       const reusable = pages
-        .filter(p => p.windowId === host?.windowId && p.url.startsWith('about:blank#pi-agent-pool'))
-        .sort((a, b) => Number(b.targetId === hostId) - Number(a.targetId === hostId));
+        .filter(p => p.windowId === host?.windowId && isPoolUrl(p.url))
+        .sort((a, b) => Number(a.targetId === hostId) - Number(b.targetId === hostId));
       let leased;
       for (const page of reusable) {
         try {
@@ -863,7 +896,7 @@ async function main() {
           if (e.code !== 'EEXIST') throw e;
         }
       }
-      if (!leased) throw new Error('No reusable agent tab is available; provision an about:blank#pi-agent-pool tab while Vivaldi is already focused');
+      if (!leased) throw new Error('No reusable agent tab is available; the dedicated window needs an empty Vivaldi Start Page tab');
       try {
         const res = await sendTabCommand(leased.targetId, { cmd: 'evalraw', args: ['Page.navigate', JSON.stringify({ url })] });
         if (!res.ok) throw new Error(res.error);
@@ -982,7 +1015,7 @@ async function main() {
   const mutatesPool = ['nav', 'eval', 'evalraw', 'click', 'clickxy', 'type', 'loadall'].includes(cmd);
   if (mutatesPool && !existsSync(leasePath(targetId))) {
     const page = (await withBrowser(refreshPages)).find(p => p.targetId === targetId);
-    if (page?.url.startsWith('about:blank#pi-agent-pool')) {
+    if (isPoolUrl(page?.url)) {
       console.error('Error: lease this pool tab with cdp open <url> --in <target>; free pool tabs are immutable');
       process.exit(1);
     }
