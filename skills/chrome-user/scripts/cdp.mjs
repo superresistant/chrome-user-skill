@@ -363,6 +363,12 @@ async function htmlStr(cdp, sid, selector) {
   return evalStr(cdp, sid, expr);
 }
 
+async function poolNavStr(cdp, sid, url) {
+  await cdp.send('Emulation.clearDeviceMetricsOverride', {}, sid);
+  await cdp.send('Emulation.resetPageScaleFactor', {}, sid);
+  return navStr(cdp, sid, url);
+}
+
 async function navStr(cdp, sid, url) {
   try {
     const parsed = new URL(url);
@@ -562,6 +568,7 @@ async function runDaemon(targetId) {
         case 'wake': result = await wakeStr(cdp, sessionId, args[0] === '--off'); break;
         case 'html': result = await htmlStr(cdp, sessionId, args[0]); break;
         case 'nav': result = await navStr(cdp, sessionId, args[0]); break;
+        case 'pool-nav': result = await poolNavStr(cdp, sessionId, args[0]); break;
         case 'net': result = await netStr(cdp, sessionId); break;
         case 'click': result = await clickStr(cdp, sessionId, args[0]); break;
         case 'clickxy': result = await clickXyStr(cdp, sessionId, args[0], args[1]); break;
@@ -814,17 +821,10 @@ async function main() {
           stale++;
           continue;
         }
-        let sessionId;
-        try {
-          ({ sessionId } = await cdp.send('Target.attachToTarget', { targetId, flatten: true }));
-          await cdp.send('Page.navigate', { url: 'about:blank#pi-agent-pool' }, sessionId);
-          try { unlinkSync(lease); } catch {}
-          reset++;
-        } finally {
-          if (sessionId) {
-            try { await cdp.send('Target.detachFromTarget', { sessionId }); } catch {}
-          }
-        }
+        const res = await sendTabCommand(targetId, { cmd: 'pool-nav', args: ['about:blank#pi-agent-pool'] });
+        if (!res.ok) throw new Error(res.error);
+        try { unlinkSync(lease); } catch {}
+        reset++;
       }
       if (reset) await sleep(100);
       await refreshPages(cdp);
@@ -837,7 +837,7 @@ async function main() {
     const targetId = await resolveTargetId(args[0]);
     const lease = leasePath(targetId);
     if (existsSync(lease)) {
-      const res = await sendTabCommand(targetId, { cmd: 'nav', args: ['about:blank#pi-agent-pool'] });
+      const res = await sendTabCommand(targetId, { cmd: 'pool-nav', args: ['about:blank#pi-agent-pool'] });
       if (!res.ok) throw new Error(res.error);
       await withBrowser(refreshPages);
       try { unlinkSync(lease); } catch {}
@@ -898,7 +898,7 @@ async function main() {
       }
       if (!leased) throw new Error('No reusable agent tab is available; the dedicated window needs an empty Vivaldi Start Page tab');
       try {
-        const res = await sendTabCommand(leased.targetId, { cmd: 'evalraw', args: ['Page.navigate', JSON.stringify({ url })] });
+        const res = await sendTabCommand(leased.targetId, { cmd: 'pool-nav', args: [url] });
         if (!res.ok) throw new Error(res.error);
         await withBrowser(refreshPages);
       } catch (e) {
