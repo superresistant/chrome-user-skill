@@ -24,11 +24,11 @@ TargetIds and windowIds change every restart. Re-run discovery, never persist. I
 
 Daemon lifetime. Per-tab daemon attached while IPC is active; a daemon left over from an older `cdp.mjs` retires and restarts itself on the next command. Idle shutdown via `IDLE_TIMEOUT` (default 30 days); override with `CDP_IDLE_MS=<ms>`, disable with `CDP_IDLE_MS=0`. Self-cleans on tab close and browser exit; idle timer is backstop. Dead daemon → next call re-attaches WS, fine with launch-flag bypass, otherwise re-fires consent modal
 
-Default mode: DOM + JS-API. Prefer `cdp eval`, `cdp evalraw`, `cdp snap`, `fetch` from Runtime executionContext, `sessionStorage`/`document.cookie`/SPA state. Use `cdp shot` only when state lives in canvas, sealed shadow DOM, or unreachable from JS. Use `cdp click`/`clickxy` only when page rejects untrusted clicks (SCA/2FA, drag-drop, paywalls, some OAuth screens, react-joyride Next, some Radix dialogs) — `element.click()` from `eval` is `isTrusted=false` and rejected
+Default mode: DOM + JS-API. Prefer `cdp eval`, `cdp evalraw`, `cdp snap`, `fetch` from Runtime executionContext, `sessionStorage`/`document.cookie`/SPA state. Use `cdp shot` only when state lives in canvas, sealed shadow DOM, or unreachable from JS. `cdp click` invokes DOM `element.click()` (`isTrusted=false`, no mouse press/release); it is not a trusted-input fallback. `cdp clickxy` dispatches trusted CDP mouse events
 
-Click decision. Read DOM / fetch JSON → `cdp eval`. Click button on plain web app → `cdp eval` + `.click()`. Click by text → `cdp eval` + `array.find` + `.click()` (see PLAYWRIGHT-SELECTOR PITFALL). Untrusted-click rejected → `cdp click '<selector>'`. Coordinate-only (canvas, map pin, drag preview) → `cdp clickxy <x> <y>`. Before a trusted click, inspect links/actions: `target=_blank`, popups and OAuth windows bypass the pool and may raise Vivaldi; navigate the leased target instead unless the foreground flow was explicitly requested
+Click decision. Plain DOM click → `cdp click '<selector>'` or eval `.click()`. No effect → choose a visible match, scroll it into view, get its live `getBoundingClientRect()` center, then `cdp clickxy <x> <y>` (CSS pixels). `Clicked` means dispatch succeeded, not that the menu opened; verify resulting DOM state. Before trusted input, inspect links/actions: `target=_blank`, popups and OAuth windows bypass the pool and may raise Vivaldi; navigate the leased target instead unless foreground was explicitly requested
 
-Command-specific tips. `cdp snap` over `cdp html` (cheaper, filtered text); `cdp html` selector-scope when possible. `cdp type` works in cross-origin iframes; focus first via `cdp click` (trusted-focus sites) or `cdp eval '...focus()'` (cheaper). `cdp net` returns resource timings; for live HTTP bodies use `Network.enable` + `Network.responseReceived` via `evalraw`. `cdp shot` prints DPR conversion (CSS px = screenshot px / DPR; CDP Input events take CSS px). `cdp loadall <selector>` repeat-clicks until selector disappears (use for Show-more / load-more pagination)
+Command-specific tips. `cdp snap` over `cdp html` (cheaper, filtered text); `cdp html` selector-scope when possible. `cdp type` targets the focused input, including cross-origin iframes, but is ignored in inactive tabs (see Keyboard events); `cdp click` does not supply trusted focus. `cdp net` returns resource timings; for live HTTP bodies use `Network.enable` + `Network.responseReceived` via `evalraw`. `cdp shot` prints DPR conversion (CSS px = screenshot px / DPR; CDP Input events take CSS px). `cdp loadall <selector>` repeat-clicks until selector disappears (use for Show-more / load-more pagination)
 
 Page overview. Return object directly, NOT `JSON.stringify`'d — `cdp eval` already serializes via `returnByValue`; wrapping gives string-of-JSON needing double-parse. Useful keys: title, url, viewport, scroll, counts of a/button/input, h1-h3 text, forms, iframes. ARIA names/roles/hidden via `cdp snap` or `cdp evalraw $T Accessibility.getFullAXTree '{}'`. None reaches cross-origin iframes
 
@@ -49,11 +49,7 @@ PLAYWRIGHT-SELECTOR PITFALL. `cdp eval`/`cdp click` use plain DOM `querySelector
 `role=button[name="..."]` → `[role="button"]` + filter on `aria-label`/`innerText`
 `data-testid=x` → `[data-testid="x"]` (brackets-and-quotes form works)
 
-Trusted click on text-matched element: mark via eval, click by attribute
-```
-[...document.querySelectorAll("button")].find(b => b.innerText.trim() === "Save")?.setAttribute("data-cdp-target","")
-node $CDP click $T '[data-cdp-target]'
-```
+Hidden duplicates (e.g. Drive Share): `querySelector` takes the first match, even hidden. Before selecting by text/label, filter candidates for rect `width>0 && height>0` and computed `visibility==="visible"`. Scroll the chosen element with `behavior:"instant"`, recompute its rect, then pass `x+width/2`, `y+height/2` to `clickxy`. Do not reuse coordinates after layout changes
 
 Eval pitfalls. `cdp eval` sets `awaitPromise`, so an async expression blocks the 15s deadline instead of returning; for long work store the result on `window` and poll. Errors surface as `Error: Uncaught` with no detail when JS throws or return is non-serializable. Return primitives or plain objects, never DOM nodes. Complex eval fails → split to localize. Top-frame context only; same-origin iframe via `iframe.contentDocument` traversal, cross-origin via recipe below
 

@@ -747,7 +747,7 @@ Usage: cdp <command> [args]
   html  <target> [selector]         Full or selector-scoped outerHTML
   nav   <target> <url>              Navigate, wait for Page.loadEventFired + readyState=complete
   net   <target>                    performance.getEntriesByType('resource') dump
-  click   <target> <selector>       Trusted click via Input.dispatchMouseEvent
+  click   <target> <selector>       DOM click on first match (untrusted; verify resulting page state)
   clickxy <target> <x> <y>          Trusted click at CSS pixel coords
   type    <target> <text>           Input.insertText at focus; inactive browser tabs may ignore it
   loadall <target> <selector> [ms]  Repeat-click until selector disappears (default 1500ms, 5min cap)
