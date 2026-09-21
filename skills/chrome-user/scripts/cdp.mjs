@@ -350,8 +350,9 @@ async function shotStr(cdp, sid, filePath, targetId, fresh = false) {
     out,
     `Screenshot saved. Device pixel ratio (DPR): ${dpr}`,
     `Coordinate mapping:`,
-    `  Screenshot pixels → CSS pixels (for CDP Input events): divide by ${dpr}`,
-    `  e.g. screenshot point (${Math.round(100 * dpr)}, ${Math.round(200 * dpr)}) → CSS (100, 200) → use clickxy <target> 100 200`,
+    `  Screenshot pixels → DOM CSS pixels: divide by ${dpr}`,
+    `  e.g. screenshot point (${Math.round(100 * dpr)}, ${Math.round(200 * dpr)}) → DOM CSS (100, 200)`,
+    `  Emulated input may need separate calibration; DPR does not correct browser-zoom or touch offsets.`,
   ];
   if (dpr !== 1) lines.push(`  On this ${dpr}x display: CSS px = screenshot px / ${dpr} ≈ screenshot px × ${Math.round(100/dpr)/100}`);
   return lines.join('\n');
@@ -749,7 +750,7 @@ Usage: cdp <command> [args]
   nav   <target> <url>              Navigate, wait for Page.loadEventFired + readyState=complete
   net   <target>                    performance.getEntriesByType('resource') dump
   click   <target> <selector>       DOM click on first match (untrusted; verify resulting page state)
-  clickxy <target> <x> <y>          Trusted click at CSS pixel coords
+  clickxy <target> <x> <y>          Trusted mouse click at raw CDP viewport coords (nominal CSS px)
   type    <target> <text>           Input.insertText at focus; inactive browser tabs may ignore it
   loadall <target> <selector> [ms]  Repeat-click until selector disappears (default 1500ms, 5min cap)
   evalraw <target> <method> [json]  Raw CDP method passthrough; returns JSON
@@ -764,8 +765,11 @@ The page cache auto-refreshes when a prefix misses, so tabs opened after the las
 Per-command deadline is 15s; CDP_TIMEOUT_MS=<ms> shortens it for probing dead tabs, and rides
 along in each IPC request so it applies to already-running daemons.
 
-Coordinates. Screenshot pixels = CSS pixels × DPR. CDP Input events take CSS pixels.
-CSS px = screenshot px / DPR. shot prints the conversion for the current page.
+Coordinates. Screenshot pixels = DOM CSS pixels × DPR. shot prints this conversion.
+clickxy and evalraw Input.* pass coordinates through. Mobile emulation can retain hidden
+browser-zoom scaling; Vivaldi touch can also subtract a browser UI offset. Even reported
+zoom=1/scale=1 does not prove raw input equals DOM client coords. Calibrate each input
+mode/viewport on a known-safe surface and verify the resulting DOM hit; see SKILL.md.
 
 Eval pitfall. Across multiple eval calls, avoid querySelectorAll(...)[i] when the list
 can change (e.g. clicking Ignore buttons on a feed shifts indices). Use stable selectors
