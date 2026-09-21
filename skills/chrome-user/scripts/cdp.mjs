@@ -329,17 +329,18 @@ async function shotStr(cdp, sid, filePath, targetId, fresh = false) {
   let dpr = 1;
   let metrics = null;
   try {
-    metrics = JSON.parse(await evalStr(cdp, sid, '({w:innerWidth,h:innerHeight,d:devicePixelRatio})'));
+    metrics = JSON.parse(await evalStr(cdp, sid, '({w:innerWidth,h:innerHeight,d:devicePixelRatio,x:scrollX,y:scrollY})'));
     if (metrics.d > 0) dpr = metrics.d;
   } catch {}
 
-  // captureBeyondViewport repaints a tab Chrome stopped compositing, but without a clip
-  // it crops to the CSS-sized top-left region; clip in device pixels at scale 1 gives the
-  // same geometry as a plain shot
   const params = { format: 'png' };
   if (fresh && metrics) {
+    const { cssVisualViewport } = await cdp.send('Page.getLayoutMetrics', {}, sid);
+    const zoom = cssVisualViewport.zoom || 1;
+    // Clip uses document DIP: include scroll and page zoom, not device scale.
     params.captureBeyondViewport = true;
-    params.clip = { x: 0, y: 0, width: Math.round(metrics.w * dpr), height: Math.round(metrics.h * dpr), scale: 1 };
+    params.clip = { x: metrics.x * zoom, y: metrics.y * zoom,
+      width: metrics.w * zoom, height: metrics.h * zoom, scale: 1 };
   }
   const { data } = await cdp.send('Page.captureScreenshot', params, sid);
   const out = filePath || resolve(RUNTIME_DIR, `screenshot-${(targetId || 'unknown').slice(0, 8)}.png`);
@@ -743,7 +744,7 @@ Usage: cdp <command> [args]
   eval  <target> <expr>             Evaluate JS expression (top frame, returnByValue)
   shot  <target> [file] [--fresh]   Screenshot (default screenshot-<target>.png in runtime dir); prints DPR
                                     mapping. --fresh repaints an uncomposited background tab
-                                    (captureBeyondViewport with a device-pixel clip; same geometry)
+                                    (current-viewport clip with scroll offsets and browser page zoom)
   html  <target> [selector]         Full or selector-scoped outerHTML
   nav   <target> <url>              Navigate, wait for Page.loadEventFired + readyState=complete
   net   <target>                    performance.getEntriesByType('resource') dump
