@@ -754,8 +754,9 @@ Usage: cdp <command> [args]
   loadall <target> <selector> [ms]  Repeat-click until selector disappears (default 1500ms, 5min cap)
   evalraw <target> <method> [json]  Raw CDP method passthrough; returns JSON
   open  <url> --in <target>         Lease an inactive pool tab in <target>'s window without raising it
-                                    or changing its active tab. Prints the targetId on stdout. Direct tab
-                                    or window creation requires CDP_ALLOW_FOCUS=1 because Vivaldi raises.
+                                    or changing its active tab. Prints targetId before navigation; failure
+                                    exits nonzero but retains lease, with targetId/windowId on stderr.
+                                    Direct tab/window creation requires CDP_ALLOW_FOCUS=1 because Vivaldi raises.
   stop  [target]                    Stop daemon(s)
 
 <target> is a unique targetId prefix from "cdp list". Use more chars to disambiguate.
@@ -898,16 +899,15 @@ async function main() {
         }
       }
       if (!leased) throw new Error('No reusable agent tab is available; the dedicated window needs an empty Vivaldi Start Page tab');
+      console.log(leased.targetId.slice(0, 8));
+      process.stderr.write(`leased inactive tab targetId=${leased.targetId} windowId=${leased.windowId}: ${url}\n`);
       try {
         const res = await sendTabCommand(leased.targetId, { cmd: 'pool-nav', args: [url] });
         if (!res.ok) throw new Error(res.error);
         await withBrowser(refreshPages);
       } catch (e) {
-        try { unlinkSync(leasePath(leased.targetId)); } catch {}
-        throw e;
+        throw new Error(`Open failed for targetId=${leased.targetId} windowId=${leased.windowId}; lease retained (inspect with cdp eval or release with cdp close): ${e.message}`);
       }
-      process.stderr.write(`leased inactive tab in window of ${hostId.slice(0, 8)}: ${url}\n`);
-      console.log(leased.targetId.slice(0, 8));
       return;
     }
 
