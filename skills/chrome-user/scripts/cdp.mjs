@@ -315,7 +315,7 @@ async function wakeStr(cdp, sid, off = false) {
     await cdp.send('Emulation.setFocusEmulationEnabled', { enabled: false }, sid);
     return 'Focus emulation off, screencast stopped';
   }
-  // Background tabs report hasFocus()=false, visibilityState=hidden and throttle timers.
+  // Focus emulation changes renderer state, not Vivaldi's native keyboard routing.
   await cdp.send('Emulation.setFocusEmulationEnabled', { enabled: true }, sid);
   await cdp.send('Page.setWebLifecycleState', { state: 'active' }, sid);
   // An occluded or background window stops compositing, so rAF stalls near 1Hz even
@@ -739,8 +739,8 @@ Usage: cdp <command> [args]
   close  <target>                   Release leased pool tab, otherwise close tab
   pool-reset                       Recover every leased pool tab and remove stale leases
   wake   <target> [--off]           Focus emulation + active lifecycle + tiny screencast: background
-                                    tab reports hasFocus()/visible, takes key events, keeps timers and
-                                    rAF running; --off reverts
+                                    tab reports hasFocus()/visible; timers and rAF run, but native keyboard
+                                    delivery is not guaranteed; --off reverts
   snap  <target>                    Accessibility tree snapshot
   eval  <target> <expr>             Evaluate JS expression (top frame, returnByValue)
   shot  <target> [file] [--fresh]   Screenshot (default screenshot-<target>.png in runtime dir); prints DPR
@@ -751,7 +751,7 @@ Usage: cdp <command> [args]
   net   <target>                    performance.getEntriesByType('resource') dump
   click   <target> <selector>       DOM click on first match (untrusted; verify resulting page state)
   clickxy <target> <x> <y>          Trusted mouse click at raw CDP viewport coords (nominal CSS px)
-  type    <target> <text>           Input.insertText at focus; inactive browser tabs may ignore it
+  type    <target> <text>           Input.insertText; Vivaldi needs authorized, verified active-target input
   loadall <target> <selector> [ms]  Repeat-click until selector disappears (default 1500ms, 5min cap)
   evalraw <target> <method> [json]  Raw CDP method passthrough; returns JSON
   open  <url> --in <target>         Lease an inactive pool tab in <target>'s window without raising it
@@ -764,6 +764,12 @@ Usage: cdp <command> [args]
 The page cache auto-refreshes when a prefix misses, so tabs opened after the last list resolve.
 Per-command deadline is 15s; CDP_TIMEOUT_MS=<ms> shortens it for probing dead tabs, and rides
 along in each IPC request so it applies to already-running daemons.
+
+Keyboard. wake/hasFocus() and a successful CDP reply do not prove target delivery.
+Vivaldi can send background-target keys/text to another active tab. type and raw
+Input.dispatchKeyEvent/Input.insertText are blocked there unless CDP_ALLOW_FOCUS=1
+for explicitly authorized input with the intended target verified active. This flag
+never activates the target. Use DOM APIs or isolated-browser keyboard verification.
 
 Coordinates. Screenshot pixels = DOM CSS pixels × DPR. shot prints this conversion.
 clickxy and evalraw Input.* pass coordinates through. Mobile emulation can retain hidden
@@ -1007,6 +1013,19 @@ async function main() {
       } catch (e) {
         if (!(e instanceof SyntaxError)) throw e;
       }
+    }
+  }
+
+  const keyboardInput = cmd === 'type' || (cmd === 'evalraw'
+    && ['Input.dispatchKeyEvent', 'Input.insertText'].includes(cmdArgs[0]));
+  if (keyboardInput && process.env.CDP_ALLOW_FOCUS !== '1') {
+    const isVivaldi = await withBrowser(async cdp => {
+      const { targetInfos } = await cdp.send('Target.getTargets', { filter: [{}] });
+      return targetInfos.some(t => t.type === 'app'
+        && t.url.startsWith('chrome-extension://mpognobbkildjkofajifpdfhcoklimli/'));
+    });
+    if (isVivaldi) {
+      throw new Error('Vivaldi native keyboard input can reach another active tab even after wake; use DOM APIs or an isolated browser. CDP_ALLOW_FOCUS=1 is only for explicitly authorized input with the intended target verified active');
     }
   }
 
