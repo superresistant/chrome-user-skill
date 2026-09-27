@@ -45,6 +45,64 @@ function leasePath(targetId) {
   return resolve(RUNTIME_DIR, `lease-${targetId}`);
 }
 
+function writeLease(targetId, url) {
+  const lease = { url, cwd: process.cwd(), session: process.env.PI_SESSION_FILE || null,
+    pid: Number(process.env.PI_CODING_AGENT_PID) || null, created: new Date().toISOString() };
+  writeFileSync(leasePath(targetId), JSON.stringify(lease), { flag: 'wx', mode: 0o600 });
+}
+
+function readLease(targetId) {
+  const path = leasePath(targetId);
+  const text = readFileSync(path, 'utf8');
+  try {
+    const lease = JSON.parse(text);
+    if (lease && typeof lease === 'object') return lease;
+  } catch {}
+  return { url: text, legacy: true, created: statSync(path).mtime.toISOString() };
+}
+
+function leaseIds() {
+  return readdirSync(RUNTIME_DIR).filter(name => name.startsWith('lease-')).map(name => name.slice('lease-'.length));
+}
+
+function pidAlive(pid) {
+  if (!pid) return null;
+  try { process.kill(pid, 0); return true; } catch (e) { return e.code === 'EPERM'; }
+}
+
+function formatAge(iso) {
+  const min = Math.round((Date.now() - Date.parse(iso)) / 60000);
+  return min < 120 ? `${min}m` : min < 2880 ? `${Math.round(min / 60)}h` : `${Math.round(min / 1440)}d`;
+}
+
+function describeLease(targetId, lease, alive) {
+  const parts = [targetId.slice(0, 8), `age=${formatAge(lease.created)}`];
+  if (!alive) parts.push('stale(tab gone)');
+  if (lease.released) parts.push('released(reset failed; retry cdp close)');
+  if (lease.legacy) parts.push('owner=unknown(legacy)');
+  else {
+    const pa = pidAlive(lease.pid);
+    parts.push(`cwd=${lease.cwd}`, `pid=${lease.pid ?? '-'}${pa === null ? '' : pa ? '(alive)' : '(dead)'}`);
+    if (lease.session) parts.push(`session=${lease.session}${existsSync(lease.session) ? '' : '(missing)'}`);
+  }
+  parts.push(lease.url);
+  return parts.join('  ');
+}
+
+async function allPageIds(cdp) {
+  const { targetInfos } = await cdp.send('Target.getTargets');
+  return new Set(targetInfos.filter(t => t.type === 'page').map(t => t.targetId));
+}
+
+function dropVanishedLeases(pageIds) {
+  let dropped = 0;
+  for (const id of leaseIds()) {
+    if (pageIds.has(id)) continue;
+    try { unlinkSync(leasePath(id)); dropped++; } catch {}
+  }
+  return dropped;
+}
+
 const isPoolUrl = url => url?.startsWith('about:blank#pi-agent-pool');
 const isPoolCandidateUrl = url => isPoolUrl(url)
   || url === 'about:blank'
@@ -366,8 +424,18 @@ async function htmlStr(cdp, sid, selector) {
 }
 
 async function poolNavStr(cdp, sid, url) {
-  await cdp.send('Emulation.clearDeviceMetricsOverride', {}, sid);
-  await cdp.send('Emulation.resetPageScaleFactor', {}, sid);
+  const reset = async () => {
+    await cdp.send('Emulation.clearDeviceMetricsOverride', {}, sid);
+    await cdp.send('Emulation.resetPageScaleFactor', {}, sid);
+  };
+  // A hung renderer never answers the reset; navigation swaps it, then the reset is retried
+  try {
+    await reset();
+  } catch (e) {
+    const { errorText } = await cdp.send('Page.navigate', { url }, sid);
+    if (errorText) throw new Error(errorText);
+    await reset();
+  }
   return navStr(cdp, sid, url);
 }
 
@@ -737,6 +805,8 @@ Usage: cdp <command> [args]
                                     or add a win= column grouped by window
   window <target>                   windowId + bounds of the window holding this tab
   close  <target>                   Release leased pool tab, otherwise close tab
+  leases                            Lease owners (cwd, pi pid alive/dead, session), age, stale/released
+                                    state, free pool count, unleased real pages in the pool window
   pool-reset                       Recover every leased pool tab and remove stale leases
   wake   <target> [--off]           Focus emulation + active lifecycle + tiny screencast: background
                                     tab reports hasFocus()/visible; timers and rAF run, but native keyboard
@@ -754,8 +824,9 @@ Usage: cdp <command> [args]
   type    <target> <text>           Input.insertText; Vivaldi needs authorized, verified active-target input
   loadall <target> <selector> [ms]  Repeat-click until selector disappears (default 1500ms, 5min cap)
   evalraw <target> <method> [json]  Raw CDP method passthrough; returns JSON
-  open  <url> --in <target>         Lease an inactive pool tab in <target>'s window without raising it
-                                    or changing its active tab. Prints targetId before navigation; failure
+  open  <url> --in <target> [--wait S]  Lease an inactive pool tab in <target>'s window without raising it
+                                    or changing its active tab; --wait polls S seconds when all are leased.
+                                    Leases whose tab vanished are dropped. Prints targetId before navigation; failure
                                     exits nonzero but retains lease, with targetId/windowId on stderr.
                                     Direct tab/window creation requires CDP_ALLOW_FOCUS=1 because Vivaldi raises.
   stop  [target]                    Stop daemon(s)
@@ -819,20 +890,12 @@ async function main() {
   }
 
   if (cmd === 'pool-reset') {
-    const leaseFiles = readdirSync(RUNTIME_DIR).filter(name => name.startsWith('lease-'));
     let reset = 0;
     let stale = 0;
     await withBrowser(async (cdp) => {
-      const pages = await getPages(cdp);
-      const pageIds = new Set(pages.map(page => page.targetId));
-      for (const name of leaseFiles) {
-        const targetId = name.slice('lease-'.length);
-        const lease = resolve(RUNTIME_DIR, name);
-        if (!pageIds.has(targetId)) {
-          try { unlinkSync(lease); } catch {}
-          stale++;
-          continue;
-        }
+      stale = dropVanishedLeases(await allPageIds(cdp));
+      for (const targetId of leaseIds()) {
+        const lease = leasePath(targetId);
         const res = await sendTabCommand(targetId, { cmd: 'pool-nav', args: ['about:blank#pi-agent-pool'] });
         if (!res.ok) throw new Error(res.error);
         try { unlinkSync(lease); } catch {}
@@ -845,12 +908,36 @@ async function main() {
     return;
   }
 
+  if (cmd === 'leases') {
+    await withBrowser(async (cdp) => {
+      const pageIds = await allPageIds(cdp);
+      const pages = await annotateWindows(cdp, await refreshPages(cdp));
+      const leased = leaseIds();
+      const lines = leased.map(id => {
+        try { return describeLease(id, readLease(id), pageIds.has(id)); } catch { return `${id.slice(0, 8)}  unreadable`; }
+      });
+      const poolWindows = new Set(pages.filter(p => isPoolUrl(p.url) || leased.includes(p.targetId)).map(p => p.windowId));
+      const free = pages.filter(p => isPoolUrl(p.url) && !leased.includes(p.targetId)).length;
+      const unleased = pages.filter(p => poolWindows.has(p.windowId) && !isPoolUrl(p.url) && !leased.includes(p.targetId));
+      for (const p of unleased) lines.push(`${p.targetId.slice(0, 8)}  unleased real page in pool window (owner unknown; never reclaim without permission)  ${p.url}`);
+      lines.push(`${free} free pool tab(s), ${leased.length} lease(s)`);
+      console.log(lines.join('\n'));
+    });
+    return;
+  }
+
   if (cmd === 'close') {
     const targetId = await resolveTargetId(args[0]);
     const lease = leasePath(targetId);
     if (existsSync(lease)) {
       const res = await sendTabCommand(targetId, { cmd: 'pool-nav', args: ['about:blank#pi-agent-pool'] });
-      if (!res.ok) throw new Error(res.error);
+      if (!res.ok) {
+        try {
+          const current = readLease(targetId);
+          writeFileSync(lease, JSON.stringify({ ...current, released: new Date().toISOString() }), { mode: 0o600 });
+        } catch {}
+        throw new Error(`Reset of ${targetId.slice(0, 8)} failed; lease kept and marked released, retry cdp close: ${res.error}`);
+      }
       await withBrowser(refreshPages);
       try { unlinkSync(lease); } catch {}
       console.log(`Released ${targetId.slice(0, 8)}`);
@@ -882,33 +969,51 @@ async function main() {
     const newWindow = args.includes('--window') || args.includes('-w');
     const inIdx = args.indexOf('--in');
     const inTarget = inIdx >= 0 ? args[inIdx + 1] : null;
-    const url = args.find((a, i) => !a.startsWith('-') && i !== inIdx + 1) || 'about:blank';
+    const waitIdx = args.indexOf('--wait');
+    const waitSec = waitIdx >= 0 ? Number(args[waitIdx + 1]) : 0;
+    if (!(waitSec >= 0)) throw new Error('--wait needs a number of seconds');
+    const url = args.find((a, i) => !a.startsWith('-') && (inIdx < 0 || i !== inIdx + 1) && (waitIdx < 0 || i !== waitIdx + 1)) || 'about:blank';
 
     if (inTarget) {
       const hostId = await resolveTargetId(inTarget);
-      let pages = await withBrowser(async (cdp) => annotateWindows(cdp, await refreshPages(cdp)));
-      let host = pages.find(p => p.targetId === hostId);
-      if (!host) throw new Error(`Host tab ${inTarget} disappeared`);
-      const initialized = await withBrowser(cdp => initializePool(cdp, pages, host.windowId));
-      if (initialized) {
-        await sleep(100);
-        pages = await withBrowser(async (cdp) => annotateWindows(cdp, await refreshPages(cdp)));
-        host = pages.find(p => p.targetId === hostId);
-      }
-      const reusable = pages
-        .filter(p => p.windowId === host?.windowId && isPoolUrl(p.url))
-        .sort((a, b) => Number(a.targetId === hostId) - Number(b.targetId === hostId));
+      const deadline = Date.now() + waitSec * 1000;
       let leased;
-      for (const page of reusable) {
-        try {
-          writeFileSync(leasePath(page.targetId), url, { flag: 'wx', mode: 0o600 });
-          leased = page;
-          break;
-        } catch (e) {
-          if (e.code !== 'EEXIST') throw e;
+      for (let attempt = 0; ; attempt++) {
+        const { pages, windowId } = await withBrowser(async (cdp) => {
+          dropVanishedLeases(await allPageIds(cdp));
+          let pages = await annotateWindows(cdp, await refreshPages(cdp));
+          const host = pages.find(p => p.targetId === hostId);
+          if (!host) throw new Error(`Host tab ${inTarget} disappeared`);
+          if (await initializePool(cdp, pages, host.windowId)) {
+            await sleep(100);
+            pages = await annotateWindows(cdp, await refreshPages(cdp));
+          }
+          return { pages, windowId: host.windowId };
+        });
+        const reusable = pages
+          .filter(p => p.windowId === windowId && isPoolUrl(p.url))
+          .sort((a, b) => Number(a.targetId === hostId) - Number(b.targetId === hostId));
+        for (const page of reusable) {
+          try {
+            writeLease(page.targetId, url);
+            leased = page;
+            break;
+          } catch (e) {
+            if (e.code !== 'EEXIST') throw e;
+          }
         }
+        if (leased) break;
+        const held = leaseIds().filter(id => pages.some(p => p.targetId === id && p.windowId === windowId));
+        if (Date.now() >= deadline) {
+          const owners = held.map(id => { try { return describeLease(id, readLease(id), true); } catch { return id.slice(0, 8); } });
+          const hint = held.length
+            ? 'retry with --wait <seconds>, release your own leases with cdp close, inspect with cdp leases'
+            : 'the dedicated window needs an empty Vivaldi Start Page tab';
+          throw new Error(`No reusable agent tab is available in window ${windowId}; ${held.length} leased${owners.length ? `:\n  ${owners.join('\n  ')}` : ''}\n${hint}`);
+        }
+        if (attempt === 0) process.stderr.write(`all ${held.length} pool tab(s) leased; waiting up to ${waitSec}s\n`);
+        await sleep(Math.min(2000, Math.max(0, deadline - Date.now())));
       }
-      if (!leased) throw new Error('No reusable agent tab is available; the dedicated window needs an empty Vivaldi Start Page tab');
       console.log(leased.targetId.slice(0, 8));
       process.stderr.write(`leased inactive tab targetId=${leased.targetId} windowId=${leased.windowId}: ${url}\n`);
       try {

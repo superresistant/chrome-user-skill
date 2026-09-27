@@ -5,7 +5,7 @@
 // fall back to the window with fewest page tabs. AGENT_SEED_BLANK=0 means the seed
 // is a real user page — lease a pool tab instead of navigating it.
 
-import { readFileSync } from 'fs';
+import { readFileSync, readdirSync } from 'fs';
 import { homedir } from 'os';
 
 const PORT_FILES = [
@@ -70,19 +70,26 @@ try {
     process.exit(1);
   }
 
-  const poolGroups = [...groups.entries()].filter(([, tabs]) => tabs.some(t => POOL_RE.test(t.url || '')));
+  const runtimeDir = process.env.XDG_RUNTIME_DIR ? `${process.env.XDG_RUNTIME_DIR}/cdp` : `${homedir()}/.cache/cdp`;
+  let leased = new Set();
+  try { leased = new Set(readdirSync(runtimeDir).filter(n => n.startsWith('lease-')).map(n => n.slice(6))); } catch {}
+  const isPoolTab = t => POOL_RE.test(t.url || '') || leased.has(t.targetId);
+  const poolGroups = [...groups.entries()].filter(([, tabs]) => tabs.some(isPoolTab));
   if (poolGroups.length > 1) {
     process.stderr.write(`agent pool is split across ${poolGroups.length} windows; recover it before browsing\n`);
     process.exit(1);
   }
   const sorted = [...groups.entries()].sort((a, b) => a[1].length - b[1].length);
   const [agentWid, agentTabs] = poolGroups[0] || sorted[0];
-  const blank = agentTabs.find((t) => POOL_RE.test(t.url || '')) || agentTabs.find((t) => t.url && SEED_RE.test(t.url));
+  const blank = agentTabs.find((t) => POOL_RE.test(t.url || '') && !leased.has(t.targetId))
+    || agentTabs.find((t) => t.url && SEED_RE.test(t.url) && !leased.has(t.targetId));
+  const leasedTab = agentTabs.find((t) => leased.has(t.targetId));
   if (!poolGroups.length) process.stderr.write(blank
     ? 'no agent-pool tabs found; empty Start Page/about:blank tabs will be initialized on first lease\n'
     : 'no free pool markers or empty tabs found; occupied leases may belong to other tasks\n');
-  const seed = blank || agentTabs[0];
-  if (!blank) process.stderr.write(`seed tab is a real page (${seed.url}) — do not navigate it, use: cdp open <url> --in ${seed.targetId.slice(0, 8)}\n`);
+  else if (!blank && leasedTab) process.stderr.write(`all pool tabs leased; use cdp open <url> --in ${leasedTab.targetId.slice(0, 8)} --wait <seconds>, inspect with cdp leases\n`);
+  const seed = blank || leasedTab || agentTabs[0];
+  if (!blank && !leasedTab) process.stderr.write(`seed tab is a real page (${seed.url}) — do not navigate it, use: cdp open <url> --in ${seed.targetId.slice(0, 8)}\n`);
   process.stdout.write(`AGENT_WINDOW_ID=${agentWid}\nAGENT_SEED_TAB=${seed.targetId.slice(0, 8)}\nAGENT_SEED_BLANK=${blank ? 1 : 0}\nAGENT_WINDOW_TAB_COUNT=${agentTabs.length}\n`);
 } catch (e) {
   process.stderr.write(`discover-agent-window: ${e.message}\n`);

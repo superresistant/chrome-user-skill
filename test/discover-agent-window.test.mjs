@@ -6,7 +6,7 @@ import { runInNewContext } from 'node:vm';
 const source = readFileSync(new URL('../skills/chrome-user/scripts/discover-agent-window.mjs', import.meta.url), 'utf8')
   .replace(/^#!.*\n/, '').replace(/^import .*;\n/gm, '');
 
-async function discover(url) {
+async function discover(url, leases = []) {
   const pages = [
     { targetId: 'FD55E7610000', url, windowId: 2 },
     { targetId: 'AAAAAAAA0000', url: 'https://user.test/a', windowId: 1 },
@@ -28,6 +28,7 @@ async function discover(url) {
   }
   await runInNewContext(`(async () => {${source}\n})()`, {
     readFileSync: () => '12345\n/devtools/browser/test', homedir: () => '/test',
+    readdirSync: () => leases.map(id => `lease-${id}`),
     WebSocket, setTimeout: () => {},
     process: {
       env: {}, stdout: { write: text => { stdout += text; } },
@@ -64,3 +65,17 @@ for (const url of ['about:blank', 'about:blank#pi-agent-pool',
     assert.doesNotMatch(stderr, /seed tab is a real page/);
   });
 }
+
+test('all-leased pool window is still discovered by its leases', async () => {
+  const { fields, stderr } = await discover('https://leased.test/task', ['FD55E7610000']);
+  assert.equal(fields.AGENT_WINDOW_ID, '2');
+  assert.equal(fields.AGENT_SEED_TAB, 'FD55E761');
+  assert.equal(fields.AGENT_SEED_BLANK, '0');
+  assert.match(stderr, /all pool tabs leased/);
+  assert.doesNotMatch(stderr, /seed tab is a real page/);
+});
+
+test('a leased pool marker is not offered as a free seed', async () => {
+  const { fields } = await discover('about:blank#pi-agent-pool', ['FD55E7610000']);
+  assert.equal(fields.AGENT_SEED_BLANK, '0');
+});

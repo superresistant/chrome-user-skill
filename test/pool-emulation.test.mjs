@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import { mkdtemp, readFile, rm } from 'node:fs/promises';
+import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -21,7 +21,8 @@ test('pool lease boundaries clear metrics and page scale in the persistent daemo
   const dir = await mkdtemp(join(tmpdir(), 'cdp-pool-test-'));
   const portFile = join(dir, 'profile', 'DevToolsActivePort');
   const env = { ...process.env, XDG_RUNTIME_DIR: dir, CDP_PORT_FILE: portFile,
-    CDP_HOST: '127.0.0.1', CDP_TIMEOUT_MS: '5000', CDP_IDLE_MS: '60000' };
+    CDP_HOST: '127.0.0.1', CDP_TIMEOUT_MS: '5000', CDP_IDLE_MS: '60000',
+    PI_SESSION_FILE: join(dir, 'session.jsonl'), PI_CODING_AGENT_PID: String(process.pid) };
   const run = async (...args) => (await exec(process.execPath, [cli, ...args], {
     env, timeout: 15000,
   })).stdout.trim();
@@ -137,7 +138,7 @@ test('pool lease boundaries clear metrics and page scale in the persistent daemo
           assert.match(error.stderr, /lease retained/);
           return true;
         });
-        assert.equal(await readFile(join(dir, 'cdp', `lease-${target}`), 'utf8'), url + path);
+        assert.equal(JSON.parse(await readFile(join(dir, 'cdp', `lease-${target}`), 'utf8')).url, url + path);
         if (path === 'slow') {
           assert.equal(await run('eval', target, '!!document.querySelector("#form")'), 'true');
         }
@@ -146,6 +147,49 @@ test('pool lease boundaries clear metrics and page scale in the persistent daemo
         assert.equal(await run('open', url, '--in', target), target.slice(0, 8));
       });
     }
+
+    await t.test('lease records its owner and cdp leases reports it', async () => {
+      const lease = JSON.parse(await readFile(join(dir, 'cdp', `lease-${target}`), 'utf8'));
+      assert.equal(lease.url, url);
+      assert.equal(lease.pid, process.pid);
+      assert.equal(lease.session, env.PI_SESSION_FILE);
+      assert.equal(lease.cwd, process.cwd());
+      assert.ok(Date.parse(lease.created) > 0);
+      const out = await run('leases');
+      assert.match(out, new RegExp(`${target.slice(0, 8)} .*pid=${process.pid}\\(alive\\)`));
+      assert.match(out, /0 free pool tab\(s\), 1 lease\(s\)/);
+    });
+
+    await t.test('exhaustion names lease owners; open drops leases of vanished tabs', async () => {
+      await writeFile(join(dir, 'cdp', 'lease-DEADBEEF00000000'), 'https://gone.test/');
+      await assert.rejects(exec(process.execPath, [cli, 'open', url, '--in', target], { env, timeout: 15000 }), error => {
+        assert.match(error.stderr, new RegExp(`1 leased:\\n  ${target.slice(0, 8)} .*cwd=`));
+        assert.match(error.stderr, /--wait/);
+        return true;
+      });
+      await assert.rejects(readFile(join(dir, 'cdp', 'lease-DEADBEEF00000000')), { code: 'ENOENT' });
+    });
+
+    await t.test('legacy URL-only lease is still read', async () => {
+      await writeFile(join(dir, 'cdp', `lease-${target}`), url);
+      assert.match(await run('leases'), /owner=unknown\(legacy\)/);
+    });
+
+    await t.test('open --wait acquires a tab released during the wait', async () => {
+      const opening = exec(process.execPath, [cli, 'open', url + 'waited', '--in', target, '--wait', '20'], { env, timeout: 30000 });
+      await delay(2500);
+      await run('close', target);
+      const { stdout, stderr } = await opening;
+      assert.equal(stdout.trim(), target.slice(0, 8));
+      assert.match(stderr, /waiting up to 20s/);
+    });
+
+    await t.test('close releases a hung page', async () => {
+      await run('eval', target, 'setTimeout(() => { for (;;); }, 50), 1');
+      await delay(300);
+      assert.match(await run('close', target), /Released/);
+      assert.equal(await run('open', url, '--in', target), target.slice(0, 8));
+    });
   } finally {
     if (target) await run('stop', target).catch(() => {});
     browser.kill('SIGTERM');
