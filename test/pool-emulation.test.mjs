@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
+import { mkdtemp, readFile, rm, utimes, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -108,7 +108,7 @@ test('pool lease boundaries clear metrics and page scale in the persistent daemo
     assert.deepEqual(await metrics(), baseline, 'acquisition must also clean a legacy dirty marker');
 
     await t.test('pool exhaustion emits no target ID', async () => {
-      await assert.rejects(exec(process.execPath, [cli, 'open', url, '--in', target], {
+      await assert.rejects(exec(process.execPath, [cli, 'open', url, '--in', target, '--wait', '0'], {
         env, timeout: 15000,
       }), error => {
         assert.equal(error.code, 1);
@@ -162,7 +162,7 @@ test('pool lease boundaries clear metrics and page scale in the persistent daemo
 
     await t.test('exhaustion names lease owners; open drops leases of vanished tabs', async () => {
       await writeFile(join(dir, 'cdp', 'lease-DEADBEEF00000000'), 'https://gone.test/');
-      await assert.rejects(exec(process.execPath, [cli, 'open', url, '--in', target], { env, timeout: 15000 }), error => {
+      await assert.rejects(exec(process.execPath, [cli, 'open', url, '--in', target, '--wait', '0'], { env, timeout: 15000 }), error => {
         assert.match(error.stderr, new RegExp(`1 leased:\\n  ${target.slice(0, 8)} .*cwd=`));
         assert.match(error.stderr, /--wait/);
         return true;
@@ -173,6 +173,39 @@ test('pool lease boundaries clear metrics and page scale in the persistent daemo
     await t.test('legacy URL-only lease is still read', async () => {
       await writeFile(join(dir, 'cdp', `lease-${target}`), url);
       assert.match(await run('leases'), /owner=unknown\(legacy\)/);
+    });
+
+    await t.test('open reclaims ended, reused-pid and idle leases; the old owner is refused', async () => {
+      const leaseFile = join(dir, 'cdp', `lease-${target}`);
+      const dead = spawn(process.execPath, ['-e', '']);
+      await new Promise(resolve => dead.on('exit', resolve));
+      const openNoWait = () => exec(process.execPath, [cli, 'open', url + 'reclaimed', '--in', target, '--wait', '0'], { env, timeout: 15000 });
+      for (const [owner, reason] of [
+        [{ pid: dead.pid }, /reclaimed .*owner process ended/],
+        [{ pid: process.pid, pidStart: '1' }, /reclaimed .*owner process ended/],
+        [{ pid: process.pid, idle: true }, /reclaimed .*idle 30m/],
+      ]) {
+        await writeFile(leaseFile, JSON.stringify({ url, cwd: '/elsewhere', pid: owner.pid,
+          pidStart: owner.pidStart ?? null, created: new Date().toISOString() }));
+        if (owner.idle) {
+          const past = new Date(Date.now() - 30 * 60000);
+          await utimes(leaseFile, past, past);
+        }
+        assert.match(await run('leases'), /reclaimable/);
+        const { stdout, stderr } = await openNoWait();
+        assert.equal(stdout.trim(), target.slice(0, 8));
+        assert.match(stderr, reason);
+        assert.equal(JSON.parse(await readFile(leaseFile, 'utf8')).pid, process.pid);
+        assert.equal(await run('eval', target, 'location.pathname'), '/reclaimed');
+        if (owner.pid === dead.pid) {
+          const oldOwner = { ...env, PI_CODING_AGENT_PID: String(dead.pid) };
+          for (const args of [['eval', target, '1'], ['close', target]]) {
+            await assert.rejects(exec(process.execPath, [cli, ...args], { env: oldOwner, timeout: 15000 }),
+              error => /reclaimed from your lease \(owner process ended\)/.test(error.stderr));
+          }
+        }
+      }
+      await assert.rejects(openNoWait(), error => /No reusable agent tab.*\n.*\n.*idle >20m|reclaimable when/s.test(error.stderr));
     });
 
     await t.test('open --wait acquires a tab released during the wait', async () => {

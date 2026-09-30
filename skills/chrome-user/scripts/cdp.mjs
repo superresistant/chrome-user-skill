@@ -4,7 +4,7 @@
 // once per daemon. Daemon self-cleans on tab close and browser exit;
 // IDLE_TIMEOUT is the backstop. CDP_IDLE_MS overrides (ms); =0 disables.
 
-import { readFileSync, writeFileSync, unlinkSync, existsSync, mkdirSync, statSync, readdirSync } from 'fs';
+import { readFileSync, writeFileSync, unlinkSync, existsSync, mkdirSync, statSync, readdirSync, renameSync, utimesSync } from 'fs';
 import { homedir } from 'os';
 import { resolve } from 'path';
 import { spawn } from 'child_process';
@@ -29,6 +29,9 @@ const BUILD = (() => {
 const DAEMON_CONNECT_RETRIES = 20;
 const DAEMON_CONNECT_DELAY = 300;
 const MIN_TARGET_PREFIX_LEN = 8;
+const POOL_LIMIT = 10;
+const DEFAULT_OPEN_WAIT_S = 100;
+const LEASE_IDLE_MS = 20 * 60 * 1000;
 const WINDOW_CONTROL_JS = /(?:(?:\b(?:window|globalThis|self|top|parent)\s*(?:\.\s*(?:focus|open|close)|\[\s*['"](?:focus|open|close)['"]\s*\]))|(?<![\w.])(?:focus|open|close))\s*\(/;
 process.umask(0o077);
 const RUNTIME_DIR = process.env.XDG_RUNTIME_DIR
@@ -45,10 +48,63 @@ function leasePath(targetId) {
   return resolve(RUNTIME_DIR, `lease-${targetId}`);
 }
 
+function tombPath(targetId) {
+  return resolve(RUNTIME_DIR, `reclaimed-${targetId}`);
+}
+
+const MY_PID = Number(process.env.PI_CODING_AGENT_PID) || null;
+
+function procStart(pid) {
+  try { return readFileSync(`/proc/${pid}/stat`, 'utf8').split(') ').pop().split(' ')[19] || null; } catch { return null; }
+}
+
 function writeLease(targetId, url) {
   const lease = { url, cwd: process.cwd(), session: process.env.PI_SESSION_FILE || null,
-    pid: Number(process.env.PI_CODING_AGENT_PID) || null, created: new Date().toISOString() };
+    pid: MY_PID, pidStart: MY_PID ? procStart(MY_PID) : null, created: new Date().toISOString() };
   writeFileSync(leasePath(targetId), JSON.stringify(lease), { flag: 'wx', mode: 0o600 });
+}
+
+function leaseIdleMs(targetId) {
+  try { return Date.now() - statSync(leasePath(targetId)).mtimeMs; } catch { return 0; }
+}
+
+function reclaimReason(targetId, lease) {
+  if (lease.released) return 'release had failed';
+  if (pidAlive(lease.pid, lease.pidStart) === false) return 'owner process ended';
+  const idle = leaseIdleMs(targetId);
+  if (idle >= LEASE_IDLE_MS) return `idle ${Math.round(idle / 60000)}m`;
+  return null;
+}
+
+function ownsLease(lease) {
+  return (lease.pid ?? null) === MY_PID && lease.cwd === process.cwd();
+}
+
+function reclaimedFromMe(targetId) {
+  let tomb;
+  try { tomb = JSON.parse(readFileSync(tombPath(targetId), 'utf8')); } catch { return null; }
+  let lease = null;
+  try { lease = readLease(targetId); } catch {}
+  if (lease && ownsLease(lease)) return null;
+  return (MY_PID && tomb.pid === MY_PID) || tomb.cwd === process.cwd() ? tomb : null;
+}
+
+function assertNotReclaimed(targetId) {
+  const tomb = reclaimedFromMe(targetId);
+  if (tomb) throw new Error(`Tab ${targetId.slice(0, 8)} was reclaimed from your lease (${tomb.reason}) at ${tomb.at} and may now belong to another task; open a new tab with cdp open <url> --in <tab>`);
+}
+
+async function reclaimLease(targetId, lease, reason) {
+  const claim = resolve(RUNTIME_DIR, `claim-${targetId}-${process.pid}`);
+  try { renameSync(leasePath(targetId), claim); } catch { return false; }
+  writeFileSync(tombPath(targetId), JSON.stringify({ pid: lease.pid ?? null, cwd: lease.cwd ?? null,
+    session: lease.session ?? null, url: lease.url, reason, at: new Date().toISOString() }), { mode: 0o600 });
+  try { unlinkSync(claim); } catch {}
+  try {
+    const conn = await connectToSocket(sockPath(targetId));
+    await sendCommand(conn, { cmd: 'stop' });
+  } catch {}
+  return true;
 }
 
 function readLease(targetId) {
@@ -65,9 +121,10 @@ function leaseIds() {
   return readdirSync(RUNTIME_DIR).filter(name => name.startsWith('lease-')).map(name => name.slice('lease-'.length));
 }
 
-function pidAlive(pid) {
+function pidAlive(pid, start) {
   if (!pid) return null;
-  try { process.kill(pid, 0); return true; } catch (e) { return e.code === 'EPERM'; }
+  try { process.kill(pid, 0); } catch (e) { if (e.code !== 'EPERM') return false; }
+  return !start || procStart(pid) === start;
 }
 
 function formatAge(iso) {
@@ -76,12 +133,15 @@ function formatAge(iso) {
 }
 
 function describeLease(targetId, lease, alive) {
-  const parts = [targetId.slice(0, 8), `age=${formatAge(lease.created)}`];
+  const parts = [targetId.slice(0, 8), `age=${formatAge(lease.created)}`,
+    `idle=${formatAge(new Date(Date.now() - leaseIdleMs(targetId)).toISOString())}`];
   if (!alive) parts.push('stale(tab gone)');
+  const reason = reclaimReason(targetId, lease);
+  if (reason) parts.push(`reclaimable(${reason})`);
   if (lease.released) parts.push('released(reset failed; retry cdp close)');
   if (lease.legacy) parts.push('owner=unknown(legacy)');
   else {
-    const pa = pidAlive(lease.pid);
+    const pa = pidAlive(lease.pid, lease.pidStart);
     parts.push(`cwd=${lease.cwd}`, `pid=${lease.pid ?? '-'}${pa === null ? '' : pa ? '(alive)' : '(dead)'}`);
     if (lease.session) parts.push(`session=${lease.session}${existsSync(lease.session) ? '' : '(missing)'}`);
   }
@@ -99,6 +159,11 @@ function dropVanishedLeases(pageIds) {
   for (const id of leaseIds()) {
     if (pageIds.has(id)) continue;
     try { unlinkSync(leasePath(id)); dropped++; } catch {}
+  }
+  for (const name of readdirSync(RUNTIME_DIR)) {
+    if (name.startsWith('reclaimed-') && !pageIds.has(name.slice('reclaimed-'.length))) {
+      try { unlinkSync(resolve(RUNTIME_DIR, name)); } catch {}
+    }
   }
   return dropped;
 }
@@ -242,7 +307,7 @@ async function getPages(cdp) {
   return targetInfos.filter(t => t.type === 'page' && (!t.url.startsWith('chrome://') || isPoolCandidateUrl(t.url)));
 }
 
-async function initializePool(cdp, pages, windowId, limit = 5) {
+async function initializePool(cdp, pages, windowId, limit = POOL_LIMIT) {
   const existing = pages.filter(p => p.windowId === windowId && isPoolUrl(p.url)).length;
   const candidates = pages
     .filter(p => p.windowId === windowId && !isPoolUrl(p.url) && isPoolCandidateUrl(p.url))
@@ -805,8 +870,8 @@ Usage: cdp <command> [args]
                                     or add a win= column grouped by window
   window <target>                   windowId + bounds of the window holding this tab
   close  <target>                   Release leased pool tab, otherwise close tab
-  leases                            Lease owners (cwd, pi pid alive/dead, session), age, stale/released
-                                    state, free pool count, unleased real pages in the pool window
+  leases                            Lease owners (cwd, pi pid alive/dead, session), age, idle, stale/released/
+                                    reclaimable state, free pool count, unleased real pages in the pool window
   pool-reset                       Recover every leased pool tab and remove stale leases
   wake   <target> [--off]           Focus emulation + active lifecycle + tiny screencast: background
                                     tab reports hasFocus()/visible; timers and rAF run, but native keyboard
@@ -825,7 +890,8 @@ Usage: cdp <command> [args]
   loadall <target> <selector> [ms]  Repeat-click until selector disappears (default 1500ms, 5min cap)
   evalraw <target> <method> [json]  Raw CDP method passthrough; returns JSON
   open  <url> --in <target> [--wait S]  Lease an inactive pool tab in <target>'s window without raising it
-                                    or changing its active tab; --wait polls S seconds when all are leased.
+                                    or changing its active tab; when all are leased, reclaims a lease whose
+                                    owner process ended or idle >20m, else polls S seconds (default 100).
                                     Leases whose tab vanished are dropped. Prints targetId before navigation; failure
                                     exits nonzero but retains lease, with targetId/windowId on stderr.
                                     Direct tab/window creation requires CDP_ALLOW_FOCUS=1 because Vivaldi raises.
@@ -928,6 +994,7 @@ async function main() {
 
   if (cmd === 'close') {
     const targetId = await resolveTargetId(args[0]);
+    assertNotReclaimed(targetId);
     const lease = leasePath(targetId);
     if (existsSync(lease)) {
       const res = await sendTabCommand(targetId, { cmd: 'pool-nav', args: ['about:blank#pi-agent-pool'] });
@@ -970,7 +1037,7 @@ async function main() {
     const inIdx = args.indexOf('--in');
     const inTarget = inIdx >= 0 ? args[inIdx + 1] : null;
     const waitIdx = args.indexOf('--wait');
-    const waitSec = waitIdx >= 0 ? Number(args[waitIdx + 1]) : 0;
+    const waitSec = waitIdx >= 0 ? Number(args[waitIdx + 1]) : DEFAULT_OPEN_WAIT_S;
     if (!(waitSec >= 0)) throw new Error('--wait needs a number of seconds');
     const url = args.find((a, i) => !a.startsWith('-') && (inIdx < 0 || i !== inIdx + 1) && (waitIdx < 0 || i !== waitIdx + 1)) || 'about:blank';
 
@@ -1004,10 +1071,30 @@ async function main() {
         }
         if (leased) break;
         const held = leaseIds().filter(id => pages.some(p => p.targetId === id && p.windowId === windowId));
+        const reclaimable = held.flatMap(id => {
+          try {
+            const lease = readLease(id);
+            const reason = reclaimReason(id, lease);
+            return reason ? [{ id, lease, reason }] : [];
+          } catch { return []; }
+        }).sort((a, b) => Number(a.reason.startsWith('idle')) - Number(b.reason.startsWith('idle')) || leaseIdleMs(b.id) - leaseIdleMs(a.id));
+        for (const { id, lease, reason } of reclaimable) {
+          if (!await reclaimLease(id, lease, reason)) continue;
+          try {
+            writeLease(id, url);
+          } catch (e) {
+            if (e.code !== 'EEXIST') throw e;
+            continue;
+          }
+          leased = pages.find(p => p.targetId === id);
+          process.stderr.write(`reclaimed ${id.slice(0, 8)} (${reason}) from cwd=${lease.cwd ?? 'unknown'} pid=${lease.pid ?? '-'}\n`);
+          break;
+        }
+        if (leased) break;
         if (Date.now() >= deadline) {
           const owners = held.map(id => { try { return describeLease(id, readLease(id), true); } catch { return id.slice(0, 8); } });
           const hint = held.length
-            ? 'retry with --wait <seconds>, release your own leases with cdp close, inspect with cdp leases'
+            ? `held tabs become reclaimable when their owner process ends or after ${LEASE_IDLE_MS / 60000}m idle; retry with a longer --wait <seconds> (and a matching command timeout), release your own leases with cdp close, inspect with cdp leases; tasks not needing the user's logins can use a headless browser instead`
             : 'the dedicated window needs an empty Vivaldi Start Page tab';
           throw new Error(`No reusable agent tab is available in window ${windowId}; ${held.length} leased${owners.length ? `:\n  ${owners.join('\n  ')}` : ''}\n${hint}`);
         }
@@ -1140,6 +1227,9 @@ async function main() {
     cmdArgs.length = 0;
     cmdArgs.push(file, fresh ? '--fresh' : '');
   }
+
+  assertNotReclaimed(targetId);
+  try { utimesSync(leasePath(targetId), new Date(), new Date()); } catch {}
 
   const mutatesPool = ['nav', 'eval', 'evalraw', 'click', 'clickxy', 'type', 'loadall'].includes(cmd);
   if (mutatesPool && !existsSync(leasePath(targetId))) {
