@@ -34,7 +34,8 @@ const DEFAULT_OPEN_WAIT_S = 100;
 const LEASE_IDLE_MS = 20 * 60 * 1000;
 const WINDOW_CONTROL_JS = /(?:(?:\b(?:window|globalThis|self|top|parent)\s*(?:\.\s*(?:focus|open|close)|\[\s*['"](?:focus|open|close)['"]\s*\]))|(?<![\w.])(?:focus|open|close))\s*\(/;
 process.umask(0o077);
-const RUNTIME_DIR = process.env.XDG_RUNTIME_DIR
+const RUNTIME_DIR = process.env.CDP_RUNTIME_DIR ? resolve(process.env.CDP_RUNTIME_DIR)
+  : process.env.XDG_RUNTIME_DIR
   ? resolve(process.env.XDG_RUNTIME_DIR, 'cdp')
   : resolve(homedir(), '.cache', 'cdp');
 try { mkdirSync(RUNTIME_DIR, { recursive: true, mode: 0o700 }); } catch {}
@@ -177,12 +178,11 @@ function getWsUrl() {
   const browsers = ['google-chrome', 'google-chrome-beta', 'chromium', 'vivaldi', 'vivaldi-snapshot', 'BraveSoftware/Brave-Browser', 'microsoft-edge'];
   const base = resolve(homedir(), '.config');
   const pair = (name) => [resolve(base, name, 'DevToolsActivePort'), resolve(base, name, 'Default/DevToolsActivePort')];
-  const candidates = [
-    process.env.CDP_PORT_FILE,
-    ...browsers.flatMap(pair),
-  ].filter(Boolean);
+  const candidates = process.env.CDP_PORT_FILE ? [process.env.CDP_PORT_FILE] : browsers.flatMap(pair);
   const portFile = candidates.find(existsSync);
-  if (!portFile) throw new Error('No DevToolsActivePort found. Enable remote debugging at chrome://inspect/#remote-debugging');
+  if (!portFile) throw new Error(process.env.CDP_PORT_FILE
+    ? `CDP_PORT_FILE ${process.env.CDP_PORT_FILE} not found; is that browser (profile.mjs start) running?`
+    : 'No DevToolsActivePort found. Enable remote debugging at chrome://inspect/#remote-debugging');
   const lines = readFileSync(portFile, 'utf8').trim().split('\n');
   if (lines.length < 2 || !lines[0] || !lines[1]) throw new Error(`Invalid DevToolsActivePort file: ${portFile}`);
   return `ws://${process.env.CDP_HOST || '127.0.0.1'}:${lines[0]}${lines[1]}`;

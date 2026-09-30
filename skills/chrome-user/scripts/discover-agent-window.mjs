@@ -8,14 +8,13 @@
 import { readFileSync, readdirSync } from 'fs';
 import { homedir } from 'os';
 
-const PORT_FILES = [
-  process.env.CDP_PORT_FILE,
+const PORT_FILES = process.env.CDP_PORT_FILE ? [process.env.CDP_PORT_FILE] : [
   `${homedir()}/.config/vivaldi/DevToolsActivePort`,
   `${homedir()}/.config/google-chrome/DevToolsActivePort`,
   `${homedir()}/.config/chromium/DevToolsActivePort`,
   `${homedir()}/.config/BraveSoftware/Brave-Browser/DevToolsActivePort`,
   `${homedir()}/.config/microsoft-edge/DevToolsActivePort`,
-].filter(Boolean);
+];
 
 const POOL_RE = /^about:blank#pi-agent-pool/;
 const SEED_RE = /^(?:about:blank$|chrome:\/\/(?:vivaldi-webui\/startpage|newtab)(?:[/?#]|$))/;
