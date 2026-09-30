@@ -7,7 +7,7 @@
 import { readFileSync, writeFileSync, unlinkSync, existsSync, mkdirSync, statSync, readdirSync, renameSync, utimesSync } from 'fs';
 import { homedir } from 'os';
 import { resolve } from 'path';
-import { spawn } from 'child_process';
+import { spawn, execFileSync } from 'child_process';
 import net from 'net';
 
 const TIMEOUT = Number(process.env.CDP_TIMEOUT_MS) > 0 ? Number(process.env.CDP_TIMEOUT_MS) : 15000;
@@ -31,6 +31,7 @@ const DAEMON_CONNECT_DELAY = 300;
 const MIN_TARGET_PREFIX_LEN = 8;
 const POOL_LIMIT = 10;
 const DEFAULT_OPEN_WAIT_S = 100;
+const POOL_CREATE_IDLE_MS = Number(process.env.CDP_POOL_CREATE_IDLE_MS ?? 3000);
 const LEASE_IDLE_MS = 20 * 60 * 1000;
 const WINDOW_CONTROL_JS = /(?:(?:\b(?:window|globalThis|self|top|parent)\s*(?:\.\s*(?:focus|open|close)|\[\s*['"](?:focus|open|close)['"]\s*\]))|(?<![\w.])(?:focus|open|close))\s*\(/;
 process.umask(0o077);
@@ -326,6 +327,47 @@ async function initializePool(cdp, pages, windowId, limit = POOL_LIMIT) {
     }
   }
   return initialized;
+}
+
+function userIdleMs() {
+  try {
+    const out = execFileSync('gdbus', ['call', '--session', '--dest', 'org.gnome.Mutter.IdleMonitor',
+      '--object-path', '/org/gnome/Mutter/IdleMonitor/Core', '--method', 'org.gnome.Mutter.IdleMonitor.GetIdletime'],
+      { encoding: 'utf8', timeout: 2000, stdio: ['ignore', 'pipe', 'ignore'] });
+    return Number(out.match(/uint64 (\d+)/)?.[1] ?? Infinity);
+  } catch { return Infinity; }
+}
+
+function activeXWindow() {
+  try {
+    return execFileSync('xdotool', ['getactivewindow'], { encoding: 'utf8', timeout: 2000, stdio: ['ignore', 'pipe', 'ignore'] }).trim() || null;
+  } catch { return null; }
+}
+
+// Vivaldi raises its window for any new tab (CDP or chrome.tabs); the previously active X window is re-activated
+async function createPoolTab(cdp, windowId) {
+  const { targetInfos } = await cdp.send('Target.getTargets', { filter: [{}] });
+  const app = targetInfos.find(t => t.type === 'app' && /\/(main|window)\.html$/.test(t.url));
+  if (!app || userIdleMs() < POOL_CREATE_IDLE_MS) return false;
+  const before = activeXWindow();
+  const { sessionId } = await cdp.send('Target.attachToTarget', { targetId: app.targetId, flatten: true });
+  try {
+    const res = await cdp.send('Runtime.evaluate', { returnByValue: true, awaitPromise: true,
+      expression: `chrome.tabs.create({windowId:${Number(windowId)},active:false,url:'about:blank#pi-agent-pool'}).then(t=>t.id)` }, sessionId);
+    if (res.exceptionDetails) throw new Error(`pool tab creation failed: ${res.exceptionDetails.exception?.description || res.exceptionDetails.text}`);
+  } finally {
+    try { await cdp.send('Target.detachFromTarget', { sessionId }); } catch {}
+  }
+  if (before) {
+    for (let i = 0; i < 20; i++) {
+      await sleep(100);
+      if (activeXWindow() !== before) {
+        try { execFileSync('xdotool', ['windowactivate', before], { timeout: 2000, stdio: 'ignore' }); } catch {}
+      }
+    }
+  }
+  process.stderr.write(`created pool tab in window ${windowId}\n`);
+  return true;
 }
 
 async function withBrowser(fn) {
@@ -891,7 +933,8 @@ Usage: cdp <command> [args]
   evalraw <target> <method> [json]  Raw CDP method passthrough; returns JSON
   open  <url> --in <target> [--wait S]  Lease an inactive pool tab in <target>'s window without raising it
                                     or changing its active tab; when all are leased, reclaims a lease whose
-                                    owner process ended or idle >20m, else polls S seconds (default 100).
+                                    owner process ended or idle >20m, else adds a pool tab (<10, after user idle 3s,
+                                    focus restored), else polls S seconds (default 100).
                                     Leases whose tab vanished are dropped. Prints targetId before navigation; failure
                                     exits nonzero but retains lease, with targetId/windowId on stderr.
                                     Direct tab/window creation requires CDP_ALLOW_FOCUS=1 because Vivaldi raises.
@@ -1091,11 +1134,16 @@ async function main() {
           break;
         }
         if (leased) break;
+        const poolSize = pages.filter(p => p.windowId === windowId && (isPoolUrl(p.url) || held.includes(p.targetId))).length;
+        if (poolSize < POOL_LIMIT && await withBrowser(cdp => createPoolTab(cdp, windowId))) {
+          await sleep(300);
+          continue;
+        }
         if (Date.now() >= deadline) {
           const owners = held.map(id => { try { return describeLease(id, readLease(id), true); } catch { return id.slice(0, 8); } });
           const hint = held.length
             ? `held tabs become reclaimable when their owner process ends or after ${LEASE_IDLE_MS / 60000}m idle; retry with a longer --wait <seconds> (and a matching command timeout), release your own leases with cdp close, inspect with cdp leases; tasks not needing the user's logins can use a headless browser instead`
-            : 'the dedicated window needs an empty Vivaldi Start Page tab';
+            : `the dedicated window needs an empty Vivaldi Start Page tab; one is created automatically once the user is idle ${POOL_CREATE_IDLE_MS / 1000}s (Vivaldi only)`;
           throw new Error(`No reusable agent tab is available in window ${windowId}; ${held.length} leased${owners.length ? `:\n  ${owners.join('\n  ')}` : ''}\n${hint}`);
         }
         if (attempt === 0) process.stderr.write(`all ${held.length} pool tab(s) leased; waiting up to ${waitSec}s\n`);
