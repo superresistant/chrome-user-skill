@@ -12,7 +12,7 @@ const exec = promisify(execFile);
 const cli = fileURLToPath(new URL('../skills/chrome-user/scripts/cdp.mjs', import.meta.url));
 const browserBin = process.env.CDP_TEST_VIVALDI;
 
-test('Vivaldi: exhausted pool creates a background pool tab in the agent window', {
+test('Vivaldi: exhausted pool creates a pool tab; emulated hi-DPR shot is downscaled instead of repeating', {
   skip: !browserBin && 'Set CDP_TEST_VIVALDI; requires Xvfb',
   timeout: 90000,
 }, async () => {
@@ -52,6 +52,21 @@ test('Vivaldi: exhausted pool creates a background pool tab in the agent window'
     assert.equal(await win(second), await win(first));
     assert.equal((await run('eval', second, 'location.hash')).stdout.trim(), '#two');
     assert.match((await run('leases')).stdout, /0 free pool tab\(s\), 2 lease\(s\)/);
+
+    await run('eval', second, `document.body.style.margin=0;for(let i=0;i<20;i++)document.body.insertAdjacentHTML('beforeend',
+      '<div style="height:200px;background:rgb('+(i*12)+','+(240-i*12)+',128)"></div>');1`);
+    await run('evalraw', second, 'Emulation.setDeviceMetricsOverride', JSON.stringify({ width: 390, height: 844, deviceScaleFactor: 2, mobile: true }));
+    await run('eval', second, 'scrollTo(0,500),1');
+    const file = join(dir, 'shot.png');
+    const shot = (await run('shot', second, file, '--fresh')).stdout;
+    assert.match(shot, /Downscaled/, 'emulated 1688px output exceeds the Xvfb window surface');
+    const ratio = Number(shot.match(/divide by ([\d.]+)/)[1]);
+    const expected = JSON.parse((await run('eval', second, 'getComputedStyle(document.elementFromPoint(10,800)).backgroundColor.match(/\\d+/g).map(Number)')).stdout);
+    const { stdout: pixel } = await exec('python3', ['-c', `import sys,json
+from PIL import Image
+im=Image.open(sys.argv[1]).convert('RGB'); r=float(sys.argv[2])
+print(json.dumps(im.getpixel((round(10*r),round(800*r)))))`, file, String(ratio)]);
+    JSON.parse(pixel).forEach((v, i) => assert.ok(Math.abs(v - expected[i]) <= 3, `bottom of shot must show the block at CSS y=800, got ${pixel} want ${expected}`));
   } finally {
     await run('stop').catch(() => {});
     browser?.kill('SIGTERM');

@@ -490,6 +490,19 @@ async function wakeStr(cdp, sid, off = false) {
   return 'Focus emulated, lifecycle active, screencast forcing frames (tab stays in background)';
 }
 
+async function vivaldiDeviceScale(cdp) {
+  const { targetInfos } = await cdp.send('Target.getTargets', { filter: [{}] });
+  const app = targetInfos.find(t => t.type === 'app' && /\/(main|window)\.html$/.test(t.url));
+  if (!app) return null;
+  const { sessionId } = await cdp.send('Target.attachToTarget', { targetId: app.targetId, flatten: true });
+  try {
+    const { result } = await cdp.send('Runtime.evaluate', { expression: 'devicePixelRatio', returnByValue: true }, sessionId);
+    return result.value || null;
+  } finally {
+    try { await cdp.send('Target.detachFromTarget', { sessionId }); } catch {}
+  }
+}
+
 async function shotStr(cdp, sid, filePath, targetId, fresh = false) {
   let dpr = 1;
   let metrics = null;
@@ -499,27 +512,39 @@ async function shotStr(cdp, sid, filePath, targetId, fresh = false) {
   } catch {}
 
   const params = { format: 'png' };
-  if (fresh && metrics) {
+  let scale = 1;
+  if (metrics) {
     const { cssVisualViewport } = await cdp.send('Page.getLayoutMetrics', {}, sid);
     const zoom = cssVisualViewport.zoom || 1;
     // Clip uses document DIP: include scroll and page zoom, not device scale.
-    params.captureBeyondViewport = true;
-    params.clip = { x: metrics.x * zoom, y: metrics.y * zoom,
-      width: metrics.w * zoom, height: metrics.h * zoom, scale: 1 };
+    const clip = { x: metrics.x * zoom, y: metrics.y * zoom, width: metrics.w * zoom, height: metrics.h * zoom };
+    // Vivaldi paints emulated viewports into the real window surface; output taller than it repeats the top
+    try {
+      const real = await vivaldiDeviceScale(cdp);
+      if (real) {
+        const { bounds } = await cdp.send('Browser.getWindowForTarget', { targetId });
+        const pixels = clip.height * dpr / zoom;
+        if (pixels > bounds.height * real) scale = Math.max(0.1, (bounds.height - 100) * real / pixels);
+      }
+    } catch {}
+    if (fresh || scale < 1) params.clip = { ...clip, scale };
+    if (fresh) params.captureBeyondViewport = true;
   }
   const { data } = await cdp.send('Page.captureScreenshot', params, sid);
   const out = filePath || resolve(RUNTIME_DIR, `screenshot-${(targetId || 'unknown').slice(0, 8)}.png`);
   writeFileSync(out, Buffer.from(data, 'base64'));
 
+  const ratio = Math.round(dpr * scale * 1000) / 1000;
   const lines = [
     out,
     `Screenshot saved. Device pixel ratio (DPR): ${dpr}`,
+    ...(scale < 1 ? [`Downscaled ×${Math.round(scale * 1000) / 1000}: emulated viewport exceeds the window surface (Vivaldi would repeat content); pixel ratio ${ratio}`] : []),
     `Coordinate mapping:`,
-    `  Screenshot pixels → DOM CSS pixels: divide by ${dpr}`,
-    `  e.g. screenshot point (${Math.round(100 * dpr)}, ${Math.round(200 * dpr)}) → DOM CSS (100, 200)`,
+    `  Screenshot pixels → DOM CSS pixels: divide by ${ratio}`,
+    `  e.g. screenshot point (${Math.round(100 * ratio)}, ${Math.round(200 * ratio)}) → DOM CSS (100, 200)`,
     `  Emulated input may need separate calibration; DPR does not correct browser-zoom or touch offsets.`,
   ];
-  if (dpr !== 1) lines.push(`  On this ${dpr}x display: CSS px = screenshot px / ${dpr} ≈ screenshot px × ${Math.round(100/dpr)/100}`);
+  if (ratio !== 1) lines.push(`  On this ${ratio}x capture: CSS px = screenshot px / ${ratio} ≈ screenshot px × ${Math.round(100/ratio)/100}`);
   return lines.join('\n');
 }
 
