@@ -455,7 +455,6 @@ async function snapshotStr(cdp, sid, compact = false) {
 }
 
 async function evalStr(cdp, sid, expression) {
-  await cdp.send('Runtime.enable', {}, sid);
   let result;
   try {
     result = await cdp.send('Runtime.evaluate', {

@@ -49,6 +49,7 @@ async function start(name, headed) {
   for (const dir of [p.dir, p.profile, p.runtime]) mkdirSync(dir, { recursive: true, mode: 0o700 });
   rmSync(p.port, { force: true });
   const args = [`--user-data-dir=${p.profile}`, '--remote-debugging-port=0', '--remote-allow-origins=*',
+    '--disable-blink-features=AutomationControlled',
     '--no-first-run', '--no-default-browser-check', '--password-store=basic', '--window-size=1280,900'];
   if (!headed) {
     const major = execFileSync(BROWSER, ['--version'], { encoding: 'utf8' }).match(/(\d+)\./)?.[1];
