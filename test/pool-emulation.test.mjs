@@ -217,6 +217,19 @@ test('pool lease boundaries clear metrics and page scale in the persistent daemo
       assert.match(stderr, /waiting up to 20s/);
     });
 
+    await t.test('release drops new-document scripts and wake of the previous lessee', async () => {
+      await run('nav', target, url);
+      const focusBefore = await run('eval', target, 'document.hasFocus()');
+      await raw('Page.addScriptToEvaluateOnNewDocument', { source: 'window.__leak = 1' });
+      await run('wake', target);
+      await run('nav', target, url);
+      assert.equal(await run('eval', target, 'typeof window.__leak'), 'number');
+      await run('close', target);
+      await run('open', url, '--in', target);
+      assert.equal(await run('eval', target, 'typeof window.__leak'), 'undefined');
+      assert.equal(await run('eval', target, 'document.hasFocus()'), focusBefore);
+    });
+
     await t.test('close releases a hung page', async () => {
       await run('eval', target, 'setTimeout(() => { for (;;); }, 50), 1');
       await delay(300);

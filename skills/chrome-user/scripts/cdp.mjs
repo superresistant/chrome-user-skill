@@ -909,6 +909,16 @@ async function sendTabCommand(targetId, req) {
 
 // Stop daemons
 
+// CDP session state (new-document scripts, wake, bindings, Fetch interception) dies with the daemon's session
+async function dropTabSession(targetId) {
+  const sp = sockPath(targetId);
+  try {
+    const conn = await connectToSocket(sp);
+    await sendCommand(conn, { cmd: 'stop' });
+  } catch { return; }
+  for (let i = 0; i < 20 && existsSync(sp); i++) await sleep(50);
+}
+
 async function stopDaemons(targetPrefix) {
   if (!existsSync(PAGES_CACHE)) return;
   const pages = JSON.parse(readFileSync(PAGES_CACHE, 'utf8'));
@@ -1030,6 +1040,7 @@ async function main() {
       stale = dropVanishedLeases(await allPageIds(cdp));
       for (const targetId of leaseIds()) {
         const lease = leasePath(targetId);
+        await dropTabSession(targetId);
         const res = await sendTabCommand(targetId, { cmd: 'pool-nav', args: ['about:blank#pi-agent-pool'] });
         if (!res.ok) throw new Error(res.error);
         try { unlinkSync(lease); } catch {}
@@ -1065,6 +1076,7 @@ async function main() {
     assertNotReclaimed(targetId);
     const lease = leasePath(targetId);
     if (existsSync(lease)) {
+      await dropTabSession(targetId);
       const res = await sendTabCommand(targetId, { cmd: 'pool-nav', args: ['about:blank#pi-agent-pool'] });
       if (!res.ok) {
         try {
