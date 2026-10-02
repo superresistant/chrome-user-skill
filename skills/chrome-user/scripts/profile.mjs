@@ -10,7 +10,7 @@ const ROOT = process.env.CDP_PROFILE_ROOT || resolve(homedir(), '.local/share/pi
 const BROWSER = process.env.CDP_PROFILE_BROWSER || 'google-chrome';
 const USAGE = `profile.mjs start <name> [--headed] | stop <name> | status <name> | env <name> | list
 
-start   launch (or reuse) Chrome on ~/.local/share/pi-browser-profiles/<name>; headless unless --headed
+start   launch (or reuse) Chrome on ~/.local/share/pi-browser-profiles/<name>; on a private Xvfb display unless --headed (headless if Xvfb missing)
         (--headed shows a window on the user's desktop: only for human verification/CAPTCHA)
 env     print exports for cdp.mjs: eval "$(node profile.mjs env <name>)"
 stop    graceful shutdown (cookies persist)`;
@@ -42,7 +42,7 @@ async function start(name, headed) {
   const p = paths(name);
   const current = running(p);
   if (current) {
-    if (current.headed !== headed) throw new Error(`profile ${name} already running ${current.headed ? 'headed' : 'headless'}; stop it first to switch`);
+    if (current.headed !== headed) throw new Error(`profile ${name} already running ${current.headed ? 'headed' : 'in background'}; stop it first to switch`);
     console.log(envLines(p));
     return;
   }
@@ -50,17 +50,37 @@ async function start(name, headed) {
   rmSync(p.port, { force: true });
   const args = [`--user-data-dir=${p.profile}`, '--remote-debugging-port=0', '--remote-allow-origins=*',
     '--disable-blink-features=AutomationControlled',
+    '--disable-features=BackForwardCache,SpareRendererForSitePerProcess',
     '--no-first-run', '--no-default-browser-check', '--password-store=basic', '--window-size=1280,900'];
-  if (!headed) {
+  const env = { ...process.env };
+  let display = null;
+  let xvfbPid = null;
+  if (!headed && existsSync('/usr/bin/Xvfb')) {
+    // -displayfd lets Xvfb pick a free display atomically (concurrent starts)
+    const xvfb = spawn('Xvfb', ['-displayfd', '3', '-screen', '0', '1920x1080x24', '-nolisten', 'tcp'],
+      { detached: true, stdio: ['ignore', 'ignore', 'ignore', 'pipe'] });
+    display = await new Promise((done, fail) => {
+      const timer = setTimeout(() => fail(new Error('Xvfb did not report a display')), 5000);
+      xvfb.stdio[3].once('data', d => { clearTimeout(timer); done(Number(String(d).trim())); });
+      xvfb.once('exit', code => { clearTimeout(timer); fail(new Error(`Xvfb exited (${code})`)); });
+    });
+    xvfb.stdio[3].destroy();
+    xvfb.removeAllListeners('exit');
+    xvfb.unref();
+    xvfbPid = xvfb.pid;
+    env.DISPLAY = `:${display}`;
+    if (existsSync('/usr/bin/openbox')) spawn('openbox', [], { detached: true, stdio: 'ignore', env }).unref();
+    args.push('--use-angle=vulkan', '--enable-features=Vulkan');
+  } else if (!headed) {
     const major = execFileSync(BROWSER, ['--version'], { encoding: 'utf8' }).match(/(\d+)\./)?.[1];
     args.push('--headless=new');
     if (major) args.push(`--user-agent=Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/${major}.0.0.0 Safari/537.36`);
   }
   args.push('about:blank');
   const log = openSync(p.log, 'a');
-  const child = spawn(BROWSER, args, { detached: true, stdio: ['ignore', log, log] });
+  const child = spawn(BROWSER, args, { detached: true, stdio: ['ignore', log, log], env });
   child.unref();
-  writeFileSync(p.pid, JSON.stringify({ pid: child.pid, headed, started: new Date().toISOString() }), { mode: 0o600 });
+  writeFileSync(p.pid, JSON.stringify({ pid: child.pid, headed, display, xvfbPid, started: new Date().toISOString() }), { mode: 0o600 });
   for (let i = 0; i < 150 && !existsSync(p.port); i++) await sleep(100);
   if (!existsSync(p.port)) throw new Error(`browser did not expose a debugging port; see ${p.log}`);
   console.log(envLines(p));
@@ -81,6 +101,10 @@ async function stop(name) {
   }
   for (let i = 0; i < 150 && alive(); i++) await sleep(100);
   if (alive()) process.kill(info.pid, 'SIGKILL');
+  // openbox exits with its display
+  if (info.xvfbPid) {
+    try { if (readFileSync(`/proc/${info.xvfbPid}/cmdline`, 'utf8').startsWith('Xvfb')) process.kill(info.xvfbPid, 'SIGTERM'); } catch {}
+  }
   rmSync(p.port, { force: true });
   console.log(`stopped profile ${name}`);
 }
@@ -98,7 +122,7 @@ async function main() {
   if (cmd === 'status') {
     const p = paths(name);
     const info = running(p);
-    console.log(info ? `profile ${name} running pid=${info.pid} ${info.headed ? 'headed' : 'headless'} since ${info.started}` : `profile ${name} not running`);
+    console.log(info ? `profile ${name} running pid=${info.pid} ${info.headed ? 'headed' : info.display != null ? `virtual display :${info.display}` : 'headless'} since ${info.started}` : `profile ${name} not running`);
     return;
   }
   if (cmd === 'list') {

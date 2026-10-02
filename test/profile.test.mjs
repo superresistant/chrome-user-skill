@@ -7,6 +7,8 @@ import { fileURLToPath } from 'node:url';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import { createServer } from 'node:http';
+import { existsSync } from 'node:fs';
+import { setTimeout as delay } from 'node:timers/promises';
 
 const exec = promisify(execFile);
 const scripts = new URL('../skills/chrome-user/scripts/', import.meta.url);
@@ -42,8 +44,14 @@ test('dedicated profile persists cookies across restarts and isolates cdp state'
     await c('nav', tab, url + 'set');
     assert.equal(await c('eval', tab, 'document.cookie'), 'session=kept');
     assert.doesNotMatch(await c('eval', tab, 'navigator.userAgent'), /Headless/);
+    assert.equal(await c('eval', tab, 'navigator.webdriver'), 'false');
+    const display = (await run('status', 't1')).match(/virtual display :(\d+)/)?.[1];
+    assert.ok(display, 'background profile runs on its own Xvfb display');
+    assert.equal(await c('eval', tab, 'screen.width'), '1920');
     assert.match(await run('start', 't1'), /CDP_PORT_FILE/, 'second start reuses the running browser');
     assert.match(await run('stop', 't1'), /stopped/);
+    await delay(500);
+    assert.equal(existsSync(`/tmp/.X11-unix/X${display}`), false, 'stop shuts down the profile Xvfb');
     await assert.rejects(c('list'), /CDP_PORT_FILE .* not found/);
     ({ c, tab } = await withProfile());
     await c('nav', tab, url);
