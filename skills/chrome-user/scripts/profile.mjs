@@ -42,13 +42,16 @@ function envLines(p) {
 
 const MY_PID = Number(process.env.PI_CODING_AGENT_PID) || null;
 
-// One agent (cwd, or same Pi pid after cd) per running profile: profiles have no tab leases
+// One agent (cwd, or same Pi pid after cd) per profile while its pid lives: profiles have no tab leases
+function otherLiveOwner(o) {
+  if (!o?.pid || o.cwd === process.cwd() || (MY_PID && o.pid === MY_PID)) return false;
+  try { process.kill(o.pid, 0); return true; } catch { return false; }
+}
+
 function assertOwner(name, info) {
   const o = info.owner;
-  if (!o || o.cwd === process.cwd() || (MY_PID && o.pid === MY_PID) || process.env.CDP_PROFILE_SHARE === '1') return;
-  let alive = false;
-  try { if (o.pid) { process.kill(o.pid, 0); alive = true; } } catch {}
-  if (alive) throw new Error(`profile ${name} is in use by ${o.cwd} (pid ${o.pid}); ask that agent, or set CDP_PROFILE_SHARE=1 if it agreed`);
+  if (otherLiveOwner(o) && process.env.CDP_PROFILE_SHARE !== '1')
+    throw new Error(`profile ${name} is in use by ${o.cwd} (pid ${o.pid}); ask that agent, or set CDP_PROFILE_SHARE=1 if it agreed`);
 }
 
 async function browserCall(p, fn) {
@@ -96,6 +99,15 @@ async function start(name, headed) {
     console.log(envLines(p));
     return;
   }
+  // restart after a crash: the owner keeps the profile (shared restarts too) and its old Xvfb goes
+  let prev = null;
+  try { prev = JSON.parse(readFileSync(p.pid, 'utf8')); } catch {}
+  if (prev) assertOwner(name, prev);
+  const owner = otherLiveOwner(prev?.owner) ? prev.owner : { cwd: process.cwd(), pid: MY_PID };
+  let prevAlive = false;
+  try { prevAlive = !!prev?.pid && readFileSync(`/proc/${prev.pid}/cmdline`, 'utf8').includes(`--user-data-dir=${p.profile}`); } catch {}
+  if (prevAlive) throw new Error(`profile ${name} browser pid ${prev.pid} has no DevToolsActivePort (starting or hung); retry, or kill it`);
+  killXvfb(prev?.xvfbPid);
   for (const dir of [p.dir, p.profile, p.runtime]) mkdirSync(dir, { recursive: true, mode: 0o700 });
   rmSync(p.port, { force: true });
   const args = [`--user-data-dir=${p.profile}`, '--remote-debugging-port=0',
@@ -132,7 +144,7 @@ async function start(name, headed) {
   const child = spawn(BROWSER, args, { detached: true, stdio: ['ignore', log, log], env });
   child.unref();
   writeFileSync(p.pid, JSON.stringify({ pid: child.pid, headed, display, xvfbPid, started: new Date().toISOString(),
-    owner: { cwd: process.cwd(), pid: MY_PID } }), { mode: 0o600 });
+    owner }), { mode: 0o600 });
   for (let i = 0; i < 150 && !existsSync(p.port); i++) await sleep(100);
   if (!existsSync(p.port)) {
     killXvfb(xvfbPid);

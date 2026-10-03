@@ -68,7 +68,15 @@ test('dedicated profile persists cookies across restarts and isolates cdp state'
     assert.match(shell.stderr, /CDP_PORT_FILE \/nonexistent\/profile.mjs-failed not found/, 'failed env never falls back to Vivaldi');
     assert.match((await runIn(tmpdir(), env, 'env', 't1')).stdout, /CDP_PORT_FILE='\//, 'same Pi pid after cd keeps ownership');
     await runIn(tmpdir(), { ...other, CDP_PROFILE_SHARE: '1' }, 'env', 't1');
+    const crashed = JSON.parse(await readFile(join(root, 't1', 'pid'), 'utf8'));
+    process.kill(crashed.pid, 'SIGKILL');
+    await delay(1000);
+    await assert.rejects(runIn(tmpdir(), other, 'start', 't1'), /in use by/, 'non-owner cannot restart a crashed profile');
+    await runIn(tmpdir(), { ...other, CDP_PROFILE_SHARE: '1' }, 'start', 't1');
     const info = JSON.parse(await readFile(join(root, 't1', 'pid'), 'utf8'));
+    assert.deepEqual(info.owner, crashed.owner, 'shared restart keeps the original owner');
+    await delay(500);
+    assert.throws(() => process.kill(crashed.xvfbPid, 0), 'restart removes the crashed browser Xvfb');
     process.kill(info.pid, 'SIGKILL');
     await delay(1000);
     assert.match(await run('stop', 't1'), /not running/);
