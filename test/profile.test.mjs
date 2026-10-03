@@ -48,6 +48,7 @@ test('dedicated profile persists cookies across restarts and isolates cdp state'
     const display = (await run('status', 't1')).match(/virtual display :(\d+)/)?.[1];
     assert.ok(display, 'background profile runs on its own Xvfb display');
     assert.equal(await c('eval', tab, 'screen.width'), '1920');
+    assert.ok(Number(await c('eval', tab, 'outerHeight - innerHeight')) < 120, 'no unsupported-flag infobar');
     assert.match(await run('start', 't1'), /CDP_PORT_FILE/, 'second start reuses the running browser');
     assert.match(await run('stop', 't1'), /stopped/);
     await delay(500);
@@ -57,9 +58,15 @@ test('dedicated profile persists cookies across restarts and isolates cdp state'
     await c('nav', tab, url);
     assert.equal(await c('eval', tab, 'document.cookie'), 'session=kept');
     assert.match(await run('list'), /t1 {2}running/);
-    const other = env;
+    const other = { ...env, PI_CODING_AGENT_PID: String(process.ppid) };
     const runIn = (cwd, e, ...args) => exec(process.execPath, [profile, ...args], { env: e, cwd, timeout: 30000 });
-    await assert.rejects(runIn(tmpdir(), other, 'env', 't1'), /in use by/);
+    const locked = await runIn(tmpdir(), other, 'env', 't1').catch(e => e);
+    assert.match(locked.stderr, /in use by/);
+    assert.equal(locked.stdout.trim(), "export CDP_PORT_FILE='/nonexistent/profile.mjs-failed'; false");
+    const shell = await exec('bash', ['-c', `eval "$(${JSON.stringify(process.execPath)} ${JSON.stringify(profile)} env t1 2>/dev/null)"; ${JSON.stringify(process.execPath)} ${JSON.stringify(cdp)} list`],
+      { env: other, cwd: tmpdir(), timeout: 30000 }).catch(e => e);
+    assert.match(shell.stderr, /CDP_PORT_FILE \/nonexistent\/profile.mjs-failed not found/, 'failed env never falls back to Vivaldi');
+    assert.match((await runIn(tmpdir(), env, 'env', 't1')).stdout, /CDP_PORT_FILE='\//, 'same Pi pid after cd keeps ownership');
     await runIn(tmpdir(), { ...other, CDP_PROFILE_SHARE: '1' }, 'env', 't1');
     const info = JSON.parse(await readFile(join(root, 't1', 'pid'), 'utf8'));
     process.kill(info.pid, 'SIGKILL');

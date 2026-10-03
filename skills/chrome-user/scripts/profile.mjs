@@ -42,10 +42,10 @@ function envLines(p) {
 
 const MY_PID = Number(process.env.PI_CODING_AGENT_PID) || null;
 
-// One agent (cwd) per running profile: profiles have no tab leases
+// One agent (cwd, or same Pi pid after cd) per running profile: profiles have no tab leases
 function assertOwner(name, info) {
   const o = info.owner;
-  if (!o || o.cwd === process.cwd() || process.env.CDP_PROFILE_SHARE === '1') return;
+  if (!o || o.cwd === process.cwd() || (MY_PID && o.pid === MY_PID) || process.env.CDP_PROFILE_SHARE === '1') return;
   let alive = false;
   try { if (o.pid) { process.kill(o.pid, 0); alive = true; } } catch {}
   if (alive) throw new Error(`profile ${name} is in use by ${o.cwd} (pid ${o.pid}); ask that agent, or set CDP_PROFILE_SHARE=1 if it agreed`);
@@ -100,7 +100,8 @@ async function start(name, headed) {
   rmSync(p.port, { force: true });
   const args = [`--user-data-dir=${p.profile}`, '--remote-debugging-port=0',
     '--disable-blink-features=AutomationControlled',
-    '--disable-features=BackForwardCache,SpareRendererForSitePerProcess',
+    // OptimizationHints: drops PassageEmbeddingsService (~80 MB/profile); --test-type: no unsupported-flag infobar shrinking the viewport
+    '--disable-features=BackForwardCache,SpareRendererForSitePerProcess,OptimizationHints', '--test-type',
     '--no-first-run', '--no-default-browser-check', '--password-store=basic', '--window-size=1280,900'];
   const env = { ...process.env };
   let display = null;
@@ -217,4 +218,9 @@ async function main() {
   if (cmd && cmd !== 'help' && cmd !== '--help') process.exitCode = 1;
 }
 
-main().catch(e => { console.error(`profile.mjs: ${e.message}`); process.exit(1); });
+main().catch(e => {
+  console.error(`profile.mjs: ${e.message}`);
+  // eval "$(profile.mjs env|start X)" must not leave CDP_PORT_FILE unset: cdp would silently drive the user's Vivaldi
+  if (['start', 'env'].includes(process.argv[2])) console.log(`export CDP_PORT_FILE='/nonexistent/profile.mjs-failed'; false`);
+  process.exit(1);
+});
