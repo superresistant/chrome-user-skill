@@ -230,6 +230,20 @@ test('pool lease boundaries clear metrics and page scale in the persistent daemo
       assert.equal(await run('eval', target, 'document.hasFocus()'), focusBefore);
     });
 
+    await t.test('type sends trusted per-key events with Shift; clickxy presses with pressure', async () => {
+      await run('nav', target, url);
+      await run('eval', target, `window.ev=[];for(const t of ['keydown','pointerdown'])addEventListener(t,e=>ev.push([t,e.key||'',e.shiftKey,e.isTrusted,e.pressure??null]),true);
+        const f=document.querySelector('#form');f.style.cssText='position:fixed;left:10px;top:10px;width:200px;height:30px';f.focus();1`);
+      await run('type', target, 'aB!');
+      assert.equal(await run('eval', target, 'document.querySelector("#form").value'), 'aB!');
+      assert.deepEqual(JSON.parse(await run('eval', target, 'ev.filter(e=>e[0]==="keydown")')),
+        [['keydown', 'a', false, true, null], ['keydown', 'B', true, true, null], ['keydown', '!', true, true, null]]);
+      await run('clickxy', target, '50', '25');
+      const down = JSON.parse(await run('eval', target, 'ev.find(e=>e[0]==="pointerdown")'));
+      assert.equal(down[3], true);
+      assert.equal(down[4], 0.5);
+    });
+
     await t.test('close releases a hung page', async () => {
       await run('eval', target, 'setTimeout(() => { for (;;); }, 50), 1');
       await delay(300);

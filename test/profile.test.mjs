@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import { mkdtemp, rm } from 'node:fs/promises';
+import { mkdtemp, readFile, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -21,7 +21,7 @@ test('dedicated profile persists cookies across restarts and isolates cdp state'
   timeout: 90000,
 }, async () => {
   const root = await mkdtemp(join(tmpdir(), 'cdp-profile-test-'));
-  const env = { ...process.env, CDP_PROFILE_ROOT: root, CDP_PROFILE_BROWSER: browserBin };
+  const env = { ...process.env, CDP_PROFILE_ROOT: root, CDP_PROFILE_BROWSER: browserBin, PI_CODING_AGENT_PID: String(process.pid) };
   const server = createServer((req, res) => {
     if (req.url === '/set') res.setHeader('Set-Cookie', 'session=kept; Max-Age=86400; Path=/');
     res.setHeader('Content-Type', 'text/html');
@@ -57,6 +57,16 @@ test('dedicated profile persists cookies across restarts and isolates cdp state'
     await c('nav', tab, url);
     assert.equal(await c('eval', tab, 'document.cookie'), 'session=kept');
     assert.match(await run('list'), /t1 {2}running/);
+    const other = env;
+    const runIn = (cwd, e, ...args) => exec(process.execPath, [profile, ...args], { env: e, cwd, timeout: 30000 });
+    await assert.rejects(runIn(tmpdir(), other, 'env', 't1'), /in use by/);
+    await runIn(tmpdir(), { ...other, CDP_PROFILE_SHARE: '1' }, 'env', 't1');
+    const info = JSON.parse(await readFile(join(root, 't1', 'pid'), 'utf8'));
+    process.kill(info.pid, 'SIGKILL');
+    await delay(1000);
+    assert.match(await run('stop', 't1'), /not running/);
+    await delay(500);
+    assert.equal(existsSync(`/tmp/.X11-unix/X${info.display}`), false, 'stop after a browser crash still removes its Xvfb');
   } finally {
     await run('stop', 't1').catch(() => {});
     server.closeAllConnections();

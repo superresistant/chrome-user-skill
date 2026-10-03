@@ -193,7 +193,7 @@ const sleep = (ms) => new Promise(r => setTimeout(r, ms));
 
 function resolvePrefix(prefix, candidates, noun = 'target', missingHint = '') {
   const upper = prefix.toUpperCase();
-  const matches = candidates.filter(candidate => candidate.toUpperCase().startsWith(upper));
+  const matches = [...new Set(candidates.filter(candidate => candidate.toUpperCase().startsWith(upper)))];
   if (matches.length === 0) {
     const hint = missingHint ? ` ${missingHint}` : '';
     throw new Error(`No ${noun} matching prefix "${prefix}".${hint}`);
@@ -630,18 +630,40 @@ async function clickXyStr(cdp, sid, x, y) {
   const cx = parseFloat(x);
   const cy = parseFloat(y);
   if (isNaN(cx) || isNaN(cy)) throw new Error('x and y must be numbers (CSS pixels)');
+  // Hidden Vivaldi pool tabs drop CDP mouse input until woken
+  if (await evalStr(cdp, sid, 'document.visibilityState') === 'hidden') await wakeStr(cdp, sid);
+  const jitter = (a, b) => a + Math.random() * (b - a);
+  for (const [dx, dy] of [[-jitter(20, 40), jitter(5, 15)], [-jitter(3, 8), jitter(0, 3)]]) {
+    await cdp.send('Input.dispatchMouseEvent', { type: 'mouseMoved', x: cx + dx, y: cy + dy, button: 'none', buttons: 0 }, sid);
+    await sleep(jitter(30, 80));
+  }
+  await cdp.send('Input.dispatchMouseEvent', { type: 'mouseMoved', x: cx, y: cy, button: 'none', buttons: 0 }, sid);
+  await sleep(jitter(40, 120));
+  // Real mouse pointerdown has pressure 0.5; CDP default 0 is visible to pages
   const base = { x: cx, y: cy, button: 'left', clickCount: 1, modifiers: 0 };
-  await cdp.send('Input.dispatchMouseEvent', { ...base, type: 'mouseMoved' }, sid);
-  await cdp.send('Input.dispatchMouseEvent', { ...base, type: 'mousePressed' }, sid);
-  await sleep(50);
-  await cdp.send('Input.dispatchMouseEvent', { ...base, type: 'mouseReleased' }, sid);
+  await cdp.send('Input.dispatchMouseEvent', { ...base, type: 'mousePressed', buttons: 1, force: 0.5 }, sid);
+  await sleep(jitter(60, 140));
+  await cdp.send('Input.dispatchMouseEvent', { ...base, type: 'mouseReleased', buttons: 0 }, sid);
   return `Clicked at CSS (${cx}, ${cy})`;
 }
 
-// Input.insertText works in cross-origin iframes, unlike eval-based typing
+// Per-character key events (insertText fires input with no keydown/keyup); long text uses insertText to stay under the deadline
 async function typeStr(cdp, sid, text) {
   if (text == null || text === '') throw new Error('text required');
-  await cdp.send('Input.insertText', { text }, sid);
+  if ([...text].length > 80) { await cdp.send('Input.insertText', { text }, sid); return `Typed ${text.length} characters`; }
+  const shifted = '~!@#$%^&*()_+{}|:"<>?';
+  for (const ch of text) {
+    const enter = ch === '\n';
+    const up = ch.toUpperCase();
+    const vk = enter ? 13 : /^[A-Z0-9 ]$/.test(up) ? up.charCodeAt(0) : 0;
+    const code = enter ? 'Enter' : /^[A-Z]$/.test(up) ? `Key${up}` : /^[0-9]$/.test(ch) ? `Digit${ch}` : ch === ' ' ? 'Space' : '';
+    const key = enter ? 'Enter' : ch;
+    const modifiers = (ch !== ch.toLowerCase() || shifted.includes(ch)) ? 8 : 0;
+    await cdp.send('Input.dispatchKeyEvent', { type: 'keyDown', key, code, windowsVirtualKeyCode: vk, modifiers, text: enter ? '\r' : ch }, sid);
+    await sleep(20 + Math.random() * 40);
+    await cdp.send('Input.dispatchKeyEvent', { type: 'keyUp', key, code, windowsVirtualKeyCode: vk, modifiers }, sid);
+    await sleep(30 + Math.random() * 70);
+  }
   return `Typed ${text.length} characters`;
 }
 

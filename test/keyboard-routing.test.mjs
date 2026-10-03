@@ -20,7 +20,7 @@ for (const [name, browserBin] of [['Chrome', process.env.CDP_TEST_CHROME], ['Viv
     const dir = await mkdtemp(join(tmpdir(), 'cdp-keyboard-test-'));
     const portFile = join(dir, 'profile', 'DevToolsActivePort');
     const env = { ...process.env, XDG_RUNTIME_DIR: dir, CDP_PORT_FILE: portFile,
-      CDP_HOST: '127.0.0.1', CDP_TIMEOUT_MS: '5000', CDP_IDLE_MS: '60000', CDP_ALLOW_FOCUS: '0' };
+      CDP_HOST: '127.0.0.1', CDP_TIMEOUT_MS: '15000', CDP_IDLE_MS: '60000', CDP_ALLOW_FOCUS: '0' };
     let xvfb, browser, ws, target, other;
     const server = createServer((req, res) => {
       res.setHeader('Content-Type', 'text/html');
